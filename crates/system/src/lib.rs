@@ -68,6 +68,9 @@ pub mod kernel;
 pub mod messages;
 pub mod trader;
 
+#[cfg(feature = "examples")]
+pub mod user_pnl_runtime;
+
 mod registration;
 
 #[cfg(feature = "python")]

@@ -15,21 +15,32 @@
 
 //! Python bindings for the example strategy and actor configs.
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{
     data::BarType,
     enums::TimeInForce,
-    identifiers::{ActorId, ClientId, InstrumentId, StrategyId},
-    types::Quantity,
+    identifiers::{AccountId, ActorId, ClientId, InstrumentId, StrategyId, Venue},
+    types::{Currency, Quantity},
 };
 use pyo3::prelude::*;
+use rust_decimal::{Decimal, prelude::FromPrimitive};
 
 use crate::examples::{
     actors::BookImbalanceActorConfig,
     strategies::{
         CompositeMarketMakerConfig, DeltaNeutralVolConfig, EmaCrossConfig, GridMarketMakerConfig,
-        HurstVpinDirectionalConfig,
+        HurstVpinDirectionalConfig, UserPnLConfig,
     },
 };
+
+fn optional_decimal(value: Option<f64>, name: &str) -> PyResult<Option<Decimal>> {
+    match value {
+        None => Ok(None),
+        Some(v) => Decimal::from_f64(v)
+            .ok_or_else(|| to_pyvalue_err(format!("Invalid {name}: {v}")))
+            .map(Some),
+    }
+}
 
 macro_rules! impl_strategy_config_base_getters {
     ($type:ty) => {
@@ -56,6 +67,7 @@ impl_strategy_config_base_getters!(GridMarketMakerConfig);
 impl_strategy_config_base_getters!(EmaCrossConfig);
 impl_strategy_config_base_getters!(DeltaNeutralVolConfig);
 impl_strategy_config_base_getters!(HurstVpinDirectionalConfig);
+impl_strategy_config_base_getters!(UserPnLConfig);
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -608,6 +620,159 @@ impl HurstVpinDirectionalConfig {
     #[getter]
     fn max_holding_secs(&self) -> u64 {
         self.max_holding_secs
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl UserPnLConfig {
+    /// Configuration for the account-level user PnL sidecar.
+    ///
+    /// Watches `Portfolio` PnL for one venue/account
+    /// and, on `max_loss` or `max_profit`, asks every other registered strategy to
+    /// `market_exit()` until the account has no positions and no live orders, then
+    /// optionally latches `HALTED` and stops those strategies for the rest of the UTC day.
+    #[new]
+    #[pyo3(signature = (
+        venue,
+        currency,
+        account_id=None,
+        max_loss=None,
+        max_profit=None,
+        halt_day_on_max_loss=true,
+        halt_day_on_max_profit=true,
+        use_unrealized_only=false,
+        check_interval_ms=200,
+        flatten_redrive_ms=5_000,
+        flatten_timeout_ms=30_000,
+        managed_strategy_ids=None,
+        skip_flat_strategies=true,
+        reset_daily=true,
+        strategy_id=None,
+        order_id_tag=None,
+    ))]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the Python keyword API"
+    )]
+    fn py_new(
+        venue: Venue,
+        currency: Currency,
+        account_id: Option<AccountId>,
+        max_loss: Option<f64>,
+        max_profit: Option<f64>,
+        halt_day_on_max_loss: bool,
+        halt_day_on_max_profit: bool,
+        use_unrealized_only: bool,
+        check_interval_ms: u64,
+        flatten_redrive_ms: u64,
+        flatten_timeout_ms: u64,
+        managed_strategy_ids: Option<Vec<StrategyId>>,
+        skip_flat_strategies: bool,
+        reset_daily: bool,
+        strategy_id: Option<StrategyId>,
+        order_id_tag: Option<String>,
+    ) -> PyResult<Self> {
+        let mut config = Self::builder()
+            .venue(venue)
+            .currency(currency)
+            .maybe_account_id(account_id)
+            .maybe_max_loss(optional_decimal(max_loss, "max_loss")?)
+            .maybe_max_profit(optional_decimal(max_profit, "max_profit")?)
+            .halt_day_on_max_loss(halt_day_on_max_loss)
+            .halt_day_on_max_profit(halt_day_on_max_profit)
+            .use_unrealized_only(use_unrealized_only)
+            .check_interval_ms(check_interval_ms)
+            .flatten_redrive_ms(flatten_redrive_ms)
+            .flatten_timeout_ms(flatten_timeout_ms)
+            .managed_strategy_ids(managed_strategy_ids.unwrap_or_default())
+            .skip_flat_strategies(skip_flat_strategies)
+            .reset_daily(reset_daily)
+            .build();
+
+        if let Some(id) = strategy_id {
+            config.base.strategy_id = Some(id);
+        }
+
+        if let Some(tag) = order_id_tag {
+            config.base.order_id_tag = Some(tag);
+        }
+
+        config.validate().map_err(to_pyvalue_err)?;
+        Ok(config)
+    }
+
+    #[getter]
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    #[getter]
+    fn account_id(&self) -> Option<AccountId> {
+        self.account_id
+    }
+
+    #[getter]
+    fn currency(&self) -> Currency {
+        self.currency
+    }
+
+    #[getter]
+    fn max_loss(&self) -> Option<f64> {
+        self.max_loss
+            .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
+    }
+
+    #[getter]
+    fn max_profit(&self) -> Option<f64> {
+        self.max_profit
+            .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
+    }
+
+    #[getter]
+    fn halt_day_on_max_loss(&self) -> bool {
+        self.halt_day_on_max_loss
+    }
+
+    #[getter]
+    fn halt_day_on_max_profit(&self) -> bool {
+        self.halt_day_on_max_profit
+    }
+
+    #[getter]
+    fn use_unrealized_only(&self) -> bool {
+        self.use_unrealized_only
+    }
+
+    #[getter]
+    fn check_interval_ms(&self) -> u64 {
+        self.check_interval_ms
+    }
+
+    #[getter]
+    fn flatten_redrive_ms(&self) -> u64 {
+        self.flatten_redrive_ms
+    }
+
+    #[getter]
+    fn flatten_timeout_ms(&self) -> u64 {
+        self.flatten_timeout_ms
+    }
+
+    #[getter]
+    fn managed_strategy_ids(&self) -> Vec<StrategyId> {
+        self.managed_strategy_ids.clone()
+    }
+
+    #[getter]
+    fn skip_flat_strategies(&self) -> bool {
+        self.skip_flat_strategies
+    }
+
+    #[getter]
+    fn reset_daily(&self) -> bool {
+        self.reset_daily
     }
 }
 

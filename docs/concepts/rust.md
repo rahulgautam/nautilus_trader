@@ -393,6 +393,7 @@ Built-in strategy configs:
 | `ExecTesterConfig`           | `ExecTester`           |
 | `GridMarketMakerConfig`      | `GridMarketMaker`      |
 | `HurstVpinDirectionalConfig` | `HurstVpinDirectional` |
+| `UserPnLConfig`              | `UserPnL`              |
 
 `add_builtin_actor` follows the same bundled-only rule for actors used by
 examples and tests.

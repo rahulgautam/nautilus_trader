@@ -43,6 +43,7 @@ CONFIG_NAMES_EXCLUDED = frozenset(
         "EmaCrossConfig",
         "GridMarketMakerConfig",
         "HurstVpinDirectionalConfig",
+        "UserPnLConfig",
     },
 )
 

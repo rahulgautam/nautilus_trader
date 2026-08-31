@@ -22,7 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-examples = ["nautilus-trading/examples"]
+examples = ["nautilus-trading/examples", "nautilus-system/examples"]
 high-precision = ["nautilus-model/high-precision"]
 mimalloc = ["dep:mimalloc"]
 defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]

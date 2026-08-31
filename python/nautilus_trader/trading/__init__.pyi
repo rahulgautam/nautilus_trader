@@ -25,6 +25,7 @@ __all__ = [
     "ImportableStrategyConfig",
     "Strategy",
     "StrategyConfig",
+    "UserPnLConfig",
     "fx_local_from_utc",
     "fx_next_end",
     "fx_next_start",
@@ -1013,6 +1014,60 @@ class StrategyConfig:
     def log_commands(self) -> bool: ...
     @property
     def log_rejected_due_post_only_as_warning(self) -> bool: ...
+
+@typing.final
+class UserPnLConfig:
+    @property
+    def strategy_id(self) -> model.StrategyId | None: ...
+    @property
+    def order_id_tag(self) -> str | None: ...
+    def __init__(
+        self,
+        venue: model.Venue,
+        currency: model.Currency,
+        account_id: model.AccountId | None = None,
+        max_loss: float | None = None,
+        max_profit: float | None = None,
+        halt_day_on_max_loss: bool = True,
+        halt_day_on_max_profit: bool = True,
+        use_unrealized_only: bool = False,
+        check_interval_ms: int = 200,
+        flatten_redrive_ms: int = 5000,
+        flatten_timeout_ms: int = 30000,
+        managed_strategy_ids: typing.Sequence[model.StrategyId] | None = None,
+        skip_flat_strategies: bool = True,
+        reset_daily: bool = True,
+        strategy_id: model.StrategyId | None = None,
+        order_id_tag: str | None = None,
+    ) -> None: ...
+    @property
+    def venue(self) -> model.Venue: ...
+    @property
+    def account_id(self) -> model.AccountId | None: ...
+    @property
+    def currency(self) -> model.Currency: ...
+    @property
+    def max_loss(self) -> float | None: ...
+    @property
+    def max_profit(self) -> float | None: ...
+    @property
+    def halt_day_on_max_loss(self) -> bool: ...
+    @property
+    def halt_day_on_max_profit(self) -> bool: ...
+    @property
+    def use_unrealized_only(self) -> bool: ...
+    @property
+    def check_interval_ms(self) -> int: ...
+    @property
+    def flatten_redrive_ms(self) -> int: ...
+    @property
+    def flatten_timeout_ms(self) -> int: ...
+    @property
+    def managed_strategy_ids(self) -> list[model.StrategyId]: ...
+    @property
+    def skip_flat_strategies(self) -> bool: ...
+    @property
+    def reset_daily(self) -> bool: ...
 
 @typing.final
 class ForexSession(enum.Enum):

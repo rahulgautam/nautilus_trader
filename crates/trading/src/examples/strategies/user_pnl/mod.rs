@@ -13,18 +13,24 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Example trading strategies for backtesting and demonstration.
+//! Account-level user PnL sidecar.
+//!
+//! Watches venue/account PnL on a timer. On `max_loss` or `max_profit` it latches
+//! the risk engine to `REDUCING`, asks every other registered strategy to run
+//! inherited `market_exit()`, waits until the watched account has no positions
+//! and no live orders, then optionally latches `HALTED` and `stop()`s those
+//! strategies for the rest of the UTC day.
+//!
+//! Trading algorithms do not implement flatten logic. They already inherit
+//! `market_exit()` from [`Strategy`](crate::strategy::Strategy).
 
-pub mod composite_market_maker;
-pub mod delta_neutral_vol;
-pub mod ema_cross;
-pub mod grid_mm;
-pub mod hurst_vpin_directional;
-pub mod user_pnl;
+pub mod config;
+pub mod runtime;
+pub mod strategy;
 
-pub use composite_market_maker::{CompositeMarketMaker, CompositeMarketMakerConfig};
-pub use delta_neutral_vol::{DeltaNeutralVol, DeltaNeutralVolConfig};
-pub use ema_cross::{EmaCross, EmaCrossConfig};
-pub use grid_mm::{GridMarketMaker, GridMarketMakerConfig};
-pub use hurst_vpin_directional::{HurstVpinDirectional, HurstVpinDirectionalConfig};
-pub use user_pnl::{UserPnL, UserPnLConfig, UserPnLRuntime, UserPnLState};
+#[cfg(test)]
+mod tests;
+
+pub use config::UserPnLConfig;
+pub use runtime::UserPnLRuntime;
+pub use strategy::{UserPnL, UserPnLState};

@@ -31,7 +31,12 @@ node = [
   "dep:nautilus-trading",
 ]
 plugin = ["node"]
-examples = ["node", "dep:nautilus-testkit", "nautilus-trading/examples"]
+examples = [
+  "node",
+  "dep:nautilus-testkit",
+  "nautilus-trading/examples",
+  "nautilus-system/examples",
+]
 streaming = ["node", "nautilus-persistence", "nautilus-system/streaming"]
 extension-module = [
   "nautilus-common/extension-module",

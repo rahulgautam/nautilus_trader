@@ -16,6 +16,8 @@
 //! Python bindings for backtest node.
 
 use std::collections::HashMap;
+#[cfg(feature = "examples")]
+use std::rc::Rc;
 
 use nautilus_common::{actor::data_actor::ImportableActorConfig, python::cache::PyCache};
 #[cfg(feature = "examples")]
@@ -24,10 +26,12 @@ use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::identifiers::{AccountId, ActorId, Venue};
 use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
+use nautilus_system::user_pnl_runtime::KernelUserPnLRuntime;
+#[cfg(feature = "examples")]
 use nautilus_trading::examples::strategies::{
     CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol, DeltaNeutralVolConfig,
     EmaCross, EmaCrossConfig, GridMarketMaker, GridMarketMakerConfig, HurstVpinDirectional,
-    HurstVpinDirectionalConfig,
+    HurstVpinDirectionalConfig, UserPnL, UserPnLConfig,
 };
 use nautilus_trading::{ImportableExecutionAlgorithmConfig, ImportableStrategyConfig};
 use pyo3::{prelude::*, types::PyDict};
@@ -359,6 +363,7 @@ fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister>
         "EmaCross" => Some(register_ema_cross),
         "GridMarketMaker" => Some(register_grid_market_maker),
         "HurstVpinDirectional" => Some(register_hurst_vpin_directional),
+        "UserPnL" => Some(register_user_pnl),
         _ => None,
     }
 }
@@ -415,6 +420,19 @@ fn register_hurst_vpin_directional(
         .map_err(to_pyruntime_err)
 }
 
+#[cfg(feature = "examples")]
+fn register_user_pnl(engine: &mut BacktestEngine, config: &Bound<'_, PyAny>) -> PyResult<()> {
+    let config = config.extract::<UserPnLConfig>()?;
+    let runtime = Rc::new(KernelUserPnLRuntime {
+        trader: engine.kernel().trader.clone(),
+        risk_engine: engine.kernel().risk_engine.clone(),
+    });
+    let strategy = UserPnL::try_new(config).map_err(to_pyvalue_err)?;
+    engine
+        .add_strategy(strategy.with_runtime(runtime))
+        .map_err(to_pyruntime_err)
+}
+
 #[cfg(all(test, feature = "examples"))]
 mod tests {
     use pyo3::{Python, types::PyDict};
@@ -428,6 +446,7 @@ mod tests {
     #[case("EmaCross")]
     #[case("GridMarketMaker")]
     #[case("HurstVpinDirectional")]
+    #[case("UserPnL")]
     fn test_builtin_strategy_register_accepts_supported_names(#[case] type_name: &str) {
         assert!(super::builtin_strategy_register(type_name).is_some());
     }

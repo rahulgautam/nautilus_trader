@@ -676,6 +676,23 @@ impl<'a> PortfolioApi<'a> {
             .unrealized_pnls(venue, account_id, None)
     }
 
+    /// Returns the unrealized PnLs for the given venue, converted into `target_currency`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the portfolio is already borrowed.
+    #[must_use]
+    pub fn unrealized_pnls_in(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+        target_currency: Currency,
+    ) -> Option<IndexMap<Currency, Money>> {
+        self.portfolio
+            .borrow_mut()
+            .unrealized_pnls(venue, account_id, Some(target_currency))
+    }
+
     /// Returns the realized PnLs for all positions at the given venue.
     ///
     /// # Panics
@@ -690,6 +707,23 @@ impl<'a> PortfolioApi<'a> {
         self.portfolio
             .borrow_mut()
             .realized_pnls(venue, account_id, None)
+    }
+
+    /// Returns the realized PnLs for the given venue, converted into `target_currency`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the portfolio is already borrowed.
+    #[must_use]
+    pub fn realized_pnls_in(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+        target_currency: Currency,
+    ) -> Option<IndexMap<Currency, Money>> {
+        self.portfolio
+            .borrow_mut()
+            .realized_pnls(venue, account_id, Some(target_currency))
     }
 
     /// Returns net exposures by currency for the given venue.
@@ -803,6 +837,23 @@ impl<'a> PortfolioApi<'a> {
         self.portfolio
             .borrow_mut()
             .total_pnls(venue, account_id, None)
+    }
+
+    /// Returns the total PnLs for the given venue, converted into `target_currency`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the portfolio is already borrowed.
+    #[must_use]
+    pub fn total_pnls_in(
+        &self,
+        venue: &Venue,
+        account_id: Option<&AccountId>,
+        target_currency: Currency,
+    ) -> Option<IndexMap<Currency, Money>> {
+        self.portfolio
+            .borrow_mut()
+            .total_pnls(venue, account_id, Some(target_currency))
     }
 
     /// Returns the per-currency mark-to-market value of open positions at the given venue.

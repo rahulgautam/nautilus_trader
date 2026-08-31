@@ -59,6 +59,8 @@ use nautilus_model::{
 use nautilus_portfolio::{config::PortfolioConfig, python::PyPortfolio};
 use nautilus_system::get_global_pyo3_registry;
 #[cfg(feature = "examples")]
+use nautilus_system::user_pnl_runtime::KernelUserPnLRuntime;
+#[cfg(feature = "examples")]
 use nautilus_testkit::{DataTester, DataTesterConfig, ExecTester, ExecTesterConfig};
 #[cfg(feature = "examples")]
 use nautilus_trading::examples::{
@@ -66,7 +68,7 @@ use nautilus_trading::examples::{
     strategies::{
         CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol, DeltaNeutralVolConfig,
         EmaCross, EmaCrossConfig, GridMarketMaker, GridMarketMakerConfig, HurstVpinDirectional,
-        HurstVpinDirectionalConfig,
+        HurstVpinDirectionalConfig, UserPnL, UserPnLConfig,
     },
 };
 use nautilus_trading::{
@@ -1880,6 +1882,7 @@ fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister>
         "ExecTester" => Some(register_exec_tester),
         "GridMarketMaker" => Some(register_grid_market_maker),
         "HurstVpinDirectional" => Some(register_hurst_vpin_directional),
+        "UserPnL" => Some(register_user_pnl),
         _ => None,
     }
 }
@@ -1923,6 +1926,18 @@ fn register_grid_market_maker(node: &mut LiveNode, config: &Bound<'_, PyAny>) ->
 fn register_hurst_vpin_directional(node: &mut LiveNode, config: &Bound<'_, PyAny>) -> PyResult<()> {
     let config = config.extract::<HurstVpinDirectionalConfig>()?;
     node.add_strategy(HurstVpinDirectional::new(config))
+        .map_err(to_pyruntime_err)
+}
+
+#[cfg(feature = "examples")]
+fn register_user_pnl(node: &mut LiveNode, config: &Bound<'_, PyAny>) -> PyResult<()> {
+    let config = config.extract::<UserPnLConfig>()?;
+    let runtime = Rc::new(KernelUserPnLRuntime {
+        trader: node.kernel().trader.clone(),
+        risk_engine: node.kernel().risk_engine.clone(),
+    });
+    let strategy = UserPnL::try_new(config).map_err(to_pyvalue_err)?;
+    node.add_strategy(strategy.with_runtime(runtime))
         .map_err(to_pyruntime_err)
 }
 
@@ -3540,6 +3555,7 @@ class ClaimsStrategy(Strategy):
     #[case("ExecTester")]
     #[case("GridMarketMaker")]
     #[case("HurstVpinDirectional")]
+    #[case("UserPnL")]
     fn test_builtin_strategy_register_accepts_supported_names(#[case] type_name: &str) {
         assert!(super::builtin_strategy_register(type_name).is_some());
     }
