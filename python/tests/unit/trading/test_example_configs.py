@@ -20,20 +20,24 @@ import pytest
 
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientId
+from nautilus_trader.model import Currency
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
+from nautilus_trader.model import Venue
 from nautilus_trader.trading import CompositeMarketMakerConfig
 from nautilus_trader.trading import DeltaNeutralVolConfig
 from nautilus_trader.trading import EmaCrossConfig
 from nautilus_trader.trading import GridMarketMakerConfig
 from nautilus_trader.trading import HurstVpinDirectionalConfig
+from nautilus_trader.trading import UserPnLConfig
 
 
 INSTRUMENT_ID = InstrumentId.from_str("BTCUSDT.BINANCE")
 SIGNAL_INSTRUMENT_ID = InstrumentId.from_str("ETHUSDT.BINANCE")
 STRATEGY_ID = StrategyId("EXAMPLE-001")
 ORDER_ID_TAG = "001"
+USDT = Currency.from_str("USDT")
 
 
 @pytest.mark.parametrize(
@@ -72,6 +76,13 @@ ORDER_ID_TAG = "001"
             strategy_id=STRATEGY_ID,
             order_id_tag=ORDER_ID_TAG,
         ),
+        UserPnLConfig(
+            venue=Venue.from_str("BINANCE"),
+            currency=USDT,
+            max_loss=-10_000.0,
+            strategy_id=STRATEGY_ID,
+            order_id_tag=ORDER_ID_TAG,
+        ),
     ],
 )
 def test_example_strategy_config_base_readback(config: object) -> None:
@@ -80,6 +91,135 @@ def test_example_strategy_config_base_readback(config: object) -> None:
     """
     assert config.strategy_id == STRATEGY_ID
     assert config.order_id_tag == ORDER_ID_TAG
+
+
+def test_user_pnl_config_bounds_readback() -> None:
+    """
+    Test UserPnL config bounds readback.
+    """
+    config = UserPnLConfig(
+        venue=Venue.from_str("BINANCE"),
+        currency=USDT,
+        max_loss=-10_000.0,
+        max_profit=10_000.0,
+    )
+
+    assert config.max_loss == -10_000.0
+    assert config.max_profit == 10_000.0
+    assert config.halt_day_on_max_loss is True
+    assert config.halt_day_on_max_profit is True
+
+
+def test_user_pnl_config_rejects_missing_bounds() -> None:
+    """
+    Test UserPnL config rejects missing bounds.
+    """
+    with pytest.raises(ValueError, match="at least one"):
+        UserPnLConfig(venue=Venue.from_str("BINANCE"), currency=USDT)
+
+
+def test_user_pnl_config_rejects_positive_max_loss() -> None:
+    """
+    Test UserPnL config rejects positive max loss.
+    """
+    with pytest.raises(ValueError, match="max_loss"):
+        UserPnLConfig(venue=Venue.from_str("BINANCE"), currency=USDT, max_loss=10_000.0)
+
+
+def test_user_pnl_config_rejects_non_finite_max_profit() -> None:
+    """
+    Test UserPnL config rejects non-finite max profit.
+    """
+    with pytest.raises(ValueError, match="max_profit"):
+        UserPnLConfig(venue=Venue.from_str("BINANCE"), currency=USDT, max_profit=float("inf"))
+
+
+def test_user_pnl_config_rejects_unrealized_with_reset_daily() -> None:
+    """
+    Test UserPnL config rejects unrealized-only with reset daily.
+    """
+    with pytest.raises(ValueError, match="use_unrealized_only"):
+        UserPnLConfig(
+            venue=Venue.from_str("BINANCE"),
+            currency=USDT,
+            max_loss=-10_000.0,
+            use_unrealized_only=True,
+            reset_daily=True,
+        )
+
+
+def test_user_pnl_config_interval_defaults_readback() -> None:
+    """
+    Test UserPnL config interval defaults readback.
+    """
+    config = UserPnLConfig(
+        venue=Venue.from_str("BINANCE"),
+        currency=USDT,
+        max_loss=-10_000.0,
+    )
+
+    assert config.check_interval_ms == 200
+    assert config.flatten_redrive_ms == 5_000
+    assert config.flatten_timeout_ms == 30_000
+
+
+def test_user_pnl_config_custom_intervals_readback() -> None:
+    """
+    Test UserPnL config custom intervals readback.
+    """
+    config = UserPnLConfig(
+        venue=Venue.from_str("BINANCE"),
+        currency=USDT,
+        max_loss=-10_000.0,
+        check_interval_ms=1_000,
+        flatten_redrive_ms=2_000,
+        flatten_timeout_ms=60_000,
+    )
+
+    assert config.check_interval_ms == 1_000
+    assert config.flatten_redrive_ms == 2_000
+    assert config.flatten_timeout_ms == 60_000
+
+
+def test_user_pnl_config_rejects_zero_check_interval() -> None:
+    """
+    Test UserPnL config rejects zero check interval.
+    """
+    with pytest.raises(ValueError, match="check_interval_ms"):
+        UserPnLConfig(
+            venue=Venue.from_str("BINANCE"),
+            currency=USDT,
+            max_loss=-10_000.0,
+            check_interval_ms=0,
+        )
+
+
+def test_user_pnl_config_rejects_redrive_below_check_interval() -> None:
+    """
+    Test UserPnL config rejects redrive below check interval.
+    """
+    with pytest.raises(ValueError, match="flatten_redrive_ms"):
+        UserPnLConfig(
+            venue=Venue.from_str("BINANCE"),
+            currency=USDT,
+            max_loss=-10_000.0,
+            check_interval_ms=1_000,
+            flatten_redrive_ms=500,
+        )
+
+
+def test_user_pnl_config_rejects_timeout_below_redrive() -> None:
+    """
+    Test UserPnL config rejects timeout below redrive interval.
+    """
+    with pytest.raises(ValueError, match="flatten_timeout_ms"):
+        UserPnLConfig(
+            venue=Venue.from_str("BINANCE"),
+            currency=USDT,
+            max_loss=-10_000.0,
+            flatten_redrive_ms=10_000,
+            flatten_timeout_ms=5_000,
+        )
 
 
 def test_delta_neutral_vol_config_iv_param_key_readback() -> None:
