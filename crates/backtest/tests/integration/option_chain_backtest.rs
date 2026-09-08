@@ -467,6 +467,10 @@ fn test_raw_mode_oneshot_publishes_one_slice_per_update() {
     assert_eq!(last.series_id, series_id());
     assert_eq!(last.atm_strike, Some(strike)); // greeks carried underlying_price = 50000
 
+    // Default path: windowing price is the Greeks forward, not a last-trade instrument
+    assert_eq!(last.atm_price, Some(Price::from(STRIKE)));
+    assert_eq!(last.atm_instrument_id, None);
+
     let last_call_quote = quotes
         .iter()
         .rev()

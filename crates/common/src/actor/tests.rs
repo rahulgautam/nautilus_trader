@@ -2032,8 +2032,10 @@ fn test_subscription_facade_sends_exact_command_matrix(
             chain.series_id,
             &chain.strike_range,
             chain.snapshot_interval_ms,
+            chain.atm_instrument_id,
+            chain.include_greeks,
         ),
-        (series_id, &strike_range, snapshot_interval_ms)
+        (series_id, &strike_range, snapshot_interval_ms, None, true)
     );
 
     assert_eq!(
@@ -4445,8 +4447,11 @@ fn test_subscribe_and_receive_option_chain(
     let slice = OptionChainSlice {
         series_id,
         atm_strike: Some(Price::from("200.00")),
+        atm_price: None,
+        atm_instrument_id: None,
         calls: Default::default(),
         puts: Default::default(),
+        listed_strikes: Vec::new(),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::default(),
     };
@@ -4456,6 +4461,49 @@ fn test_subscribe_and_receive_option_chain(
 
     assert_eq!(actor.received_chain_slices.len(), 1);
     assert_eq!(actor.received_chain_slices[0].series_id, series_id);
+}
+
+#[rstest]
+fn test_subscribe_option_chain_with_sends_atm_fields(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
+
+    let series_id = OptionSeriesId::new(
+        Venue::from("OPRA"),
+        Ustr::from("AAPL"),
+        Ustr::from("USD"),
+        UnixNanos::from(1_711_036_800_000_000_000),
+    );
+    let strike_range = StrikeRange::AtmRelative {
+        strikes_above: 5,
+        strikes_below: 5,
+    };
+    let atm_id = InstrumentId::from("SPY.ARCA");
+    actor.subscribe_option_chain_with(
+        series_id,
+        strike_range,
+        None,
+        None,
+        None,
+        Some(atm_id),
+        false,
+    );
+
+    let commands = saver.get_messages();
+    let [DataCommand::Subscribe(SubscribeCommand::OptionChain(chain))] = commands.as_slice() else {
+        panic!("expected one option chain subscribe, was {commands:?}");
+    };
+    assert_eq!(chain.atm_instrument_id, Some(atm_id));
+    assert!(!chain.include_greeks);
 }
 
 #[rstest]
@@ -4775,8 +4823,11 @@ fn test_unsubscribe_option_chain(
     let slice = OptionChainSlice {
         series_id,
         atm_strike: None,
+        atm_price: None,
+        atm_instrument_id: None,
         calls: Default::default(),
         puts: Default::default(),
+        listed_strikes: Vec::new(),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::default(),
     };

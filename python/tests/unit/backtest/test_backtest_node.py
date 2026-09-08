@@ -489,6 +489,23 @@ def test_node_exposes_builtin_strategy_registration() -> None:
     assert hasattr(BacktestNode, "add_builtin_strategy")
 
 
+def test_node_add_instrument_registers_definition_without_quote_stream(
+    tmp_path: Path,
+) -> None:
+    """
+    Test node.add_instrument loads a definition without a quote stream.
+    """
+    node, config, _instrument, _quotes = _build_component_node(tmp_path, quote_count=2)
+    extra = TestInstrumentProvider.btcusdt_binance()
+    try:
+        cache = node.get_engine_cache(config.id)
+        assert cache.instrument(extra.id) is None
+        node.add_instrument(config.id, extra)
+        assert cache.instrument(extra.id) is not None
+    finally:
+        node.dispose()
+
+
 def test_node_empty_configs_raises() -> None:
     """
     Test node empty configs raises.

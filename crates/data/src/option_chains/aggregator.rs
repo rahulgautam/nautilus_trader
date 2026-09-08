@@ -475,6 +475,11 @@ impl OptionChainAggregator {
 
     /// Creates a point-in-time snapshot from accumulated buffers, applying strike filtering.
     ///
+    /// `atm_price` is the tracker price used to window the chain. `atm_instrument_id`
+    /// is left `None` here; the manager stamps last-trade mode after snapshotting.
+    /// `listed_strikes` is the full catalog (cache at subscribe), including names
+    /// that have not quoted yet.
+    ///
     /// Buffers are preserved (keep-latest semantics) so instruments that didn't
     /// quote since the last tick are still included in subsequent snapshots.
     ///
@@ -523,8 +528,11 @@ impl OptionChainAggregator {
         OptionChainSlice {
             series_id: self.series_id,
             atm_strike,
+            atm_price,
+            atm_instrument_id: None,
             calls,
             puts,
+            listed_strikes: catalog_strikes,
             ts_event,
             ts_init,
         }
@@ -828,6 +836,63 @@ mod tests {
         let slice2 = agg.snapshot(UnixNanos::from(200u64));
         assert_eq!(slice2.call_count(), 1);
         assert_eq!(slice2.ts_init, UnixNanos::from(200u64));
+        assert_eq!(slice2.listed_strikes, vec![Price::from("50000")]);
+    }
+
+    #[rstest]
+    fn test_snapshot_listed_offsets_step_catalog_when_quotes_have_holes() {
+        let strikes = [49000i32, 50000, 51000, 52000];
+        let mut instruments = HashMap::new();
+
+        for s in &strikes {
+            let strike = Price::from(&s.to_string());
+            let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
+            let put_id = InstrumentId::from(&format!("BTC-20240101-{s}-P.DERIBIT"));
+            instruments.insert(call_id, (strike, OptionKind::Call));
+            instruments.insert(put_id, (strike, OptionKind::Put));
+        }
+        let mut agg = OptionChainAggregator::new(
+            make_series_id(),
+            StrikeRange::Fixed(
+                strikes
+                    .iter()
+                    .map(|s| Price::from(&s.to_string()))
+                    .collect(),
+            ),
+            AtmTracker::new(),
+            instruments,
+        );
+        set_atm_via_greeks(&mut agg, 50000.0);
+
+        for s in [49000, 51000] {
+            let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
+            let put_id = InstrumentId::from(&format!("BTC-20240101-{s}-P.DERIBIT"));
+            agg.update_quote(&make_quote(call_id, "100.00", "101.00"));
+            agg.update_quote(&make_quote(put_id, "50.00", "51.00"));
+        }
+
+        let slice = agg.snapshot(UnixNanos::from(100u64));
+        assert_eq!(
+            slice.listed_strikes,
+            vec![
+                Price::from("49000"),
+                Price::from("50000"),
+                Price::from("51000"),
+                Price::from("52000"),
+            ],
+        );
+        assert_eq!(
+            slice.strikes(),
+            vec![Price::from("49000"), Price::from("51000")],
+        );
+        assert_eq!(slice.atm_strike, Some(Price::from("50000")));
+        assert!(slice.get_call_atm_offset(1).is_none());
+        assert!(slice.get_call_listed_offset(0).is_none());
+        assert_eq!(
+            slice.get_call_listed_offset(1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-51000-C.DERIBIT"),
+        );
+        assert!(slice.get_call_listed_offset(2).is_none());
     }
 
     #[rstest]

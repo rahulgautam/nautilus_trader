@@ -249,6 +249,8 @@ OPTION_CHAIN_SUBSCRIPTION_PARAMETERS = (
     "snapshot_interval_ms",
     "client_id",
     "params",
+    "atm_instrument_id",
+    "include_greeks",
 )
 INSTRUMENT_REQUEST_PARAMETERS = ("instrument_id", "start", "end", "client_id", "params")
 BOOK_SNAPSHOT_REQUEST_PARAMETERS = ("instrument_id", "depth", "client_id", "params")

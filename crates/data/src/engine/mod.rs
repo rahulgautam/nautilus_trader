@@ -586,6 +586,8 @@ impl DataEngine {
 
     /// Stops all registered data clients and bar aggregator timers.
     pub fn stop(&mut self) {
+        self.teardown_option_chain_managers();
+
         for client in self.get_clients_mut() {
             if let Err(e) = client.stop() {
                 log::error!("{e}");
@@ -603,6 +605,10 @@ impl DataEngine {
 
     /// Resets all registered data clients and clears engine state.
     pub fn reset(&mut self) {
+        // ATM trade unsubscribes must reach the adapter before `client.reset()`,
+        // which drops local subscription bookkeeping without a venue unsubscribe.
+        self.teardown_option_chain_managers();
+
         for client in self.get_clients_mut() {
             match client.reset() {
                 Ok(()) => client.clear_subscription_state(),
@@ -641,13 +647,9 @@ impl DataEngine {
             self.stop_spread_quote_aggregation(spread_id);
         }
 
-        // Tear down option chain managers to unregister their msgbus handlers
-        let managers: Vec<_> = self.option_chain_managers.drain().collect();
-        for (_, manager) in managers {
-            manager.borrow_mut().teardown(&self.clock);
-        }
-
-        self.option_chain_instrument_index.clear();
+        // Managers were already torn down at the start of `reset` so ATM
+        // unsubscribes reach the adapter before `client.reset()`. Still drop
+        // pending reference-price work and Greeks-bootstrap handlers here.
         self.cancel_pending_option_chain_requests(None);
         self.clear_option_chain_greeks_bootstraps();
 
@@ -696,6 +698,10 @@ impl DataEngine {
 
     /// Disposes the engine, stopping all clients and canceling any timers.
     pub fn dispose(&mut self) {
+        // Same ordering as `reset`/`stop`: ATM unsubscribes must reach the adapter
+        // before `client.dispose()`, and msgbus handlers must not outlive the engine.
+        self.teardown_option_chain_managers();
+
         for client in self.get_clients_mut() {
             if let Err(e) = client.dispose() {
                 log::error!("{e}");
@@ -868,6 +874,18 @@ impl DataEngine {
             return self.clients.get_mut(&backtest_id);
         }
         self.get_client(client_id, venue)
+    }
+
+    /// Resolves a client by venue routing only, with the same `BACKTEST` override as
+    /// [`Self::get_command_client`] and no default-client fallback.
+    fn get_client_for_venue(&mut self, venue: Venue) -> Option<&mut DataClientAdapter> {
+        let backtest_id = ClientId::new("BACKTEST");
+        if self.clients.contains_key(&backtest_id) {
+            return self.clients.get_mut(&backtest_id);
+        }
+
+        let client_id = *self.routing_map.get(&venue)?;
+        self.clients.get_mut(&client_id)
     }
 
     fn get_default_client(&mut self) -> Option<&mut DataClientAdapter> {
@@ -1075,7 +1093,7 @@ impl DataEngine {
                 }
             }
             SubscribeCommand::OptionChain(cmd) => {
-                self.subscribe_option_chain(cmd);
+                self.subscribe_option_chain(cmd)?;
                 return Ok(());
             }
             SubscribeCommand::Quotes(cmd) if cmd.instrument_id.is_synthetic() => {
@@ -1850,7 +1868,10 @@ impl DataEngine {
                 self.handle_quote(*quote);
                 self.drain_deferred_commands();
             }
-            DataRef::Trade(trade) => self.handle_trade(*trade),
+            DataRef::Trade(trade) => {
+                self.handle_trade(*trade);
+                self.drain_deferred_commands();
+            }
             DataRef::Bar(bar) => self.handle_bar(*bar),
             DataRef::MarkPrice(mark_price) => {
                 self.handle_mark_price(*mark_price);
@@ -2865,8 +2886,13 @@ impl DataEngine {
         );
 
         if series_empty {
+            let atm_instrument_id = manager_rc.borrow().atm_instrument_id();
             manager_rc.borrow_mut().teardown(&self.clock);
             self.option_chain_managers.remove(&series_id);
+
+            if let Some(atm_id) = atm_instrument_id {
+                self.release_atm_trade_subscription(atm_id);
+            }
 
             log::info!("Torn down empty option chain manager for {series_id}");
         }
@@ -3104,8 +3130,13 @@ impl DataEngine {
             manager_rc.borrow_mut().handle_instrument_expired(id);
         }
 
+        let atm_instrument_id = manager_rc.borrow().atm_instrument_id();
         manager_rc.borrow_mut().teardown(&self.clock);
         self.option_chain_managers.remove(&series_id);
+
+        if let Some(atm_id) = atm_instrument_id {
+            self.release_atm_trade_subscription(atm_id);
+        }
 
         log::info!("Proactively torn down expired option chain {series_id}");
     }
@@ -3686,32 +3717,85 @@ impl DataEngine {
         });
     }
 
-    fn subscribe_option_chain(&mut self, cmd: &SubscribeOptionChain) {
+    /// Subscribes an option chain, creating the per-series `OptionChainManager`.
+    ///
+    /// Instruments for the series are taken from cache at this call. ATM-relative
+    /// windows and nearest listed strike use that set only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strike range can never resolve for the requested ATM
+    /// configuration, which would otherwise leave the chain silently empty forever.
+    fn subscribe_option_chain(&mut self, cmd: &SubscribeOptionChain) -> anyhow::Result<()> {
         self.drain_deferred_commands();
         let series_id = cmd.series_id;
         self.stop_option_chain_greeks_bootstrap(series_id);
 
+        if !cmd.include_greeks {
+            if matches!(cmd.strike_range, StrikeRange::Delta { .. }) {
+                anyhow::bail!(
+                    "Cannot subscribe option chain for {series_id}: `StrikeRange::Delta` resolves from option Greeks, which `include_greeks=false` disables"
+                );
+            }
+
+            if cmd.atm_instrument_id.is_none() && !matches!(cmd.strike_range, StrikeRange::Fixed(_))
+            {
+                anyhow::bail!(
+                    "Cannot subscribe option chain for {series_id}: an ATM-based `StrikeRange` has no ATM source with `include_greeks=false`, set `atm_instrument_id` or a fixed strike range"
+                );
+            }
+        }
+
+        if let Some(atm_id) = cmd.atm_instrument_id
+            && self.get_atm_trade_client(atm_id).is_none()
+        {
+            anyhow::bail!(
+                "Cannot subscribe option chain for {series_id}: no venue routing for ATM instrument {atm_id} (venue={}). Last-trade ATM routes by venue and does not use a default-routing client; register venue routing for it (live: `RoutingConfig.venues`)",
+                atm_id.venue
+            );
+        }
+
         // Handle edits to existing subscriptions by tearing down and re-setting up the OptionChainManager.
         if let Some(old) = self.option_chain_managers.remove(&series_id) {
             log::info!("Re-subscribing option chain for {series_id}, tearing down previous");
-            let (active_ids, old_venue, old_client_id) = {
+            let (active_ids, old_venue, old_client_id, old_atm_id, old_include_greeks) = {
                 let old = old.borrow();
                 let active_ids = old
                     .all_instrument_ids()
                     .into_iter()
                     .filter(|instrument_id| old.is_instrument_active(instrument_id))
                     .collect::<Vec<_>>();
-                (active_ids, old.venue(), old.client_id())
+                (
+                    active_ids,
+                    old.venue(),
+                    old.client_id(),
+                    old.atm_instrument_id(),
+                    old.include_greeks(),
+                )
             };
             old.borrow_mut().teardown(&self.clock);
-            self.forward_option_chain_unsubscribes(&active_ids, old_venue, old_client_id);
+            self.forward_option_chain_unsubscribes(
+                &active_ids,
+                old_venue,
+                old_client_id,
+                old_include_greeks,
+            );
+            // Keep the wire up across a strike-range edit when ATM is unchanged.
+            // Teardown already dropped the old msgbus handler, so a release here
+            // would see count 0 and unsubscribe then resubscribe the same instrument.
+            if let Some(atm_id) = old_atm_id
+                && cmd.atm_instrument_id != Some(atm_id)
+            {
+                self.release_atm_trade_subscription(atm_id);
+            }
         }
 
         self.cancel_pending_option_chain_requests(Some(series_id));
 
         // For dynamic strike ranges, request a reference price from the adapter
-        // to enable instant bootstrap without waiting for the first WebSocket tick.
-        if !matches!(cmd.strike_range, StrikeRange::Fixed(_)) {
+        // to enable instant bootstrap without waiting for the first WebSocket tick,
+        // skip when ATM is driven by an instrument last trade.
+        if !matches!(cmd.strike_range, StrikeRange::Fixed(_)) && cmd.atm_instrument_id.is_none() {
             let resolved_client_id = self
                 .get_client(cmd.client_id.as_ref(), Some(&series_id.venue))
                 .map(|c| c.client_id);
@@ -3755,7 +3839,7 @@ impl DataEngine {
 
                     if !self.schedule_option_chain_reference_price_timeout() {
                         self.bootstrap_all_pending_option_chains();
-                        return;
+                        return Ok(());
                     }
 
                     let req_cmd = RequestCommand::OptionChainReferencePrice(request);
@@ -3772,12 +3856,13 @@ impl DataEngine {
                         }
                     }
 
-                    return;
+                    return Ok(());
                 }
             }
         }
 
         self.create_option_chain_manager(cmd, None);
+        Ok(())
     }
 
     fn schedule_option_chain_reference_price_timeout(&self) -> bool {
@@ -3923,6 +4008,13 @@ impl DataEngine {
 
         self.option_chain_managers
             .insert(series_id, manager_rc.clone());
+
+        // The ATM instrument may trade on a different venue than the option series,
+        // so it must be routed by its own venue rather than the chain's client.
+        if let Some(atm_id) = cmd.atm_instrument_id {
+            self.forward_atm_trade_subscribe(atm_id);
+        }
+
         manager_rc
     }
 
@@ -4062,7 +4154,7 @@ impl DataEngine {
         };
 
         // Extract info before teardown
-        let (all_ids, active_ids, venue, client_id) = {
+        let (all_ids, active_ids, venue, client_id, atm_instrument_id, include_greeks) = {
             let manager = manager_rc.borrow();
             let all_ids = manager.all_instrument_ids();
             let active_ids = all_ids
@@ -4070,7 +4162,14 @@ impl DataEngine {
                 .filter(|instrument_id| manager.is_instrument_active(instrument_id))
                 .copied()
                 .collect::<Vec<_>>();
-            (all_ids, active_ids, manager.venue(), manager.client_id())
+            (
+                all_ids,
+                active_ids,
+                manager.venue(),
+                manager.client_id(),
+                manager.atm_instrument_id(),
+                manager.include_greeks(),
+            )
         };
 
         // Remove all instruments from reverse index
@@ -4081,9 +4180,37 @@ impl DataEngine {
         manager_rc.borrow_mut().teardown(&self.clock);
 
         // Forward wire-level unsubscribes to the data client
-        self.forward_option_chain_unsubscribes(&active_ids, venue, client_id);
+        self.forward_option_chain_unsubscribes(&active_ids, venue, client_id, include_greeks);
+
+        if let Some(atm_id) = atm_instrument_id {
+            self.release_atm_trade_subscription(atm_id);
+        }
 
         log::info!("Unsubscribed option chain for {series_id}");
+    }
+
+    /// Tears down every option-chain manager and releases ATM trade streams that
+    /// no remaining msgbus subscriber still wants.
+    fn teardown_option_chain_managers(&mut self) {
+        let atm_ids: Vec<InstrumentId> = self
+            .option_chain_managers
+            .values()
+            .filter_map(|manager| manager.borrow().atm_instrument_id())
+            .collect();
+        let managers: Vec<_> = self.option_chain_managers.drain().collect();
+        for (_, manager) in managers {
+            manager.borrow_mut().teardown(&self.clock);
+        }
+        self.option_chain_instrument_index.clear();
+        self.cancel_pending_option_chain_requests(None);
+        self.clear_option_chain_greeks_bootstraps();
+
+        let mut released = AHashSet::new();
+        for atm_id in atm_ids {
+            if released.insert(atm_id) {
+                self.release_atm_trade_subscription(atm_id);
+            }
+        }
     }
 
     /// Forwards wire-level unsubscribe commands for all option chain instruments.
@@ -4092,6 +4219,7 @@ impl DataEngine {
         instrument_ids: &[InstrumentId],
         venue: Venue,
         client_id: Option<ClientId>,
+        include_greeks: bool,
     ) {
         let ts_init = self.clock.borrow().timestamp_ns();
 
@@ -4105,15 +4233,27 @@ impl DataEngine {
                 None,
                 None,
             ));
-            let greeks_cmd = UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks::new(
-                *instrument_id,
-                client_id,
-                Some(venue),
-                UUID4::new(),
-                ts_init,
-                None,
-                None,
-            ));
+
+            if let Err(e) = self.execute_unsubscribe(&quote_cmd) {
+                log::error!("Failed to execute option chain unsubscribe: {e}");
+            }
+
+            if include_greeks {
+                let greeks_cmd = UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks::new(
+                    *instrument_id,
+                    client_id,
+                    Some(venue),
+                    UUID4::new(),
+                    ts_init,
+                    None,
+                    None,
+                ));
+
+                if let Err(e) = self.execute_unsubscribe(&greeks_cmd) {
+                    log::error!("Failed to execute option chain unsubscribe: {e}");
+                }
+            }
+
             let status_cmd =
                 UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus::new(
                     *instrument_id,
@@ -4125,12 +4265,80 @@ impl DataEngine {
                     None,
                 ));
 
-            for cmd in [&quote_cmd, &greeks_cmd, &status_cmd] {
-                if let Err(e) = self.execute_unsubscribe(cmd) {
-                    log::error!("Failed to execute option chain unsubscribe: {e}");
-                }
+            if let Err(e) = self.execute_unsubscribe(&status_cmd) {
+                log::error!("Failed to execute option chain unsubscribe: {e}");
             }
         }
+    }
+
+    /// Resolves the client that serves the ATM instrument's trades.
+    ///
+    /// Ignores the chain's `client_id` and does not fall through to the default client.
+    /// Subscribe, unsubscribe, and expiry all resolve through here so they cannot reach
+    /// different clients for the same instrument.
+    fn get_atm_trade_client(
+        &mut self,
+        atm_instrument_id: InstrumentId,
+    ) -> Option<&mut DataClientAdapter> {
+        self.get_client_for_venue(atm_instrument_id.venue)
+    }
+
+    /// Drops the implicit ATM last-trade stream only when no msgbus subscriber remains.
+    ///
+    /// Two expiries can share `atm_instrument_id`, and a strategy may also have called
+    /// `subscribe_trades` on the same instrument. Adapter trade subs are a set, not a
+    /// count, so an unconditional unsubscribe would kill those remaining listeners.
+    fn release_atm_trade_subscription(&mut self, atm_instrument_id: InstrumentId) {
+        let topic = switchboard::get_trades_topic(atm_instrument_id);
+        if msgbus::exact_subscriber_count_trades(topic) > 0 {
+            return;
+        }
+
+        self.forward_atm_trade_unsubscribe(atm_instrument_id);
+    }
+
+    fn forward_atm_trade_subscribe(&mut self, atm_instrument_id: InstrumentId) {
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let venue = atm_instrument_id.venue;
+
+        let Some(client) = self.get_atm_trade_client(atm_instrument_id) else {
+            log::error!(
+                "Cannot subscribe ATM trades for {atm_instrument_id}: no client found for venue={venue}",
+            );
+            return;
+        };
+
+        client.execute_subscribe(SubscribeCommand::Trades(SubscribeTrades::new(
+            atm_instrument_id,
+            None,
+            Some(venue),
+            UUID4::new(),
+            ts_init,
+            None,
+            None,
+        )));
+    }
+
+    fn forward_atm_trade_unsubscribe(&mut self, atm_instrument_id: InstrumentId) {
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let venue = atm_instrument_id.venue;
+
+        let Some(client) = self.get_atm_trade_client(atm_instrument_id) else {
+            log::error!(
+                "Cannot unsubscribe ATM trades for {atm_instrument_id}: no client found for venue={venue}",
+            );
+            return;
+        };
+
+        client.execute_unsubscribe(&UnsubscribeCommand::Trades(UnsubscribeTrades::new(
+            atm_instrument_id,
+            None,
+            Some(venue),
+            UUID4::new(),
+            ts_init,
+            None,
+            None,
+        )));
     }
 
     fn maintain_book_updater(&mut self, instrument_id: &InstrumentId) {

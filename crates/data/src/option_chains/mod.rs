@@ -23,5 +23,8 @@ pub mod manager;
 
 pub use aggregator::{OptionChainAggregator, RebalanceAction};
 pub use atm_tracker::AtmTracker;
-pub use handlers::{OptionChainGreeksHandler, OptionChainQuoteHandler, OptionChainSlicePublisher};
+pub use handlers::{
+    OptionChainGreeksHandler, OptionChainQuoteHandler, OptionChainSlicePublisher,
+    OptionChainTradeHandler,
+};
 pub use manager::OptionChainManager;

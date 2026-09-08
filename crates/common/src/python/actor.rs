@@ -1938,8 +1938,18 @@ impl PyDataActor {
         Ok(())
     }
 
+    /// Subscribes to option chain snapshots for `series_id`.
+    ///
+    /// Default ATM is Greeks `underlying_price` with `include_greeks=True`.
+    /// Last-trade ATM is `atm_instrument_id`; that does not require skipping
+    /// Greeks. Pass `include_greeks=False` when the venue has no option Greeks
+    /// wire (equity, NSE index options). `series_id` is the option expiry key,
+    /// not the ATM instrument. `StrikeRange.atm_relative` steps listed cache
+    /// contracts; `get_call_listed_offset` steps that catalog on the slice,
+    /// `get_call_atm_offset` steps quoted rows.
     #[pyo3(name = "subscribe_option_chain")]
-    #[pyo3(signature = (series_id, strike_range, snapshot_interval_ms=None, client_id=None, params=None))]
+    #[pyo3(signature = (series_id, strike_range, snapshot_interval_ms=None, client_id=None, params=None, atm_instrument_id=None, include_greeks=true))]
+    #[expect(clippy::too_many_arguments)]
     fn py_subscribe_option_chain(
         &mut self,
         py: Python<'_>,
@@ -1948,16 +1958,20 @@ impl PyDataActor {
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        atm_instrument_id: Option<InstrumentId>,
+        include_greeks: bool,
     ) -> PyResult<()> {
         self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
-        DataActor::subscribe_option_chain(
+        DataActor::subscribe_option_chain_with(
             self.inner_mut(),
             series_id,
             strike_range.inner,
             snapshot_interval_ms,
             client_id,
             params,
+            atm_instrument_id,
+            include_greeks,
         );
         Ok(())
     }
@@ -4159,8 +4173,11 @@ class CapturingActor:
                 UnixNanos::from(1_711_036_800_000_000_000),
             ),
             atm_strike: None,
+            atm_price: None,
+            atm_instrument_id: None,
             calls: Default::default(),
             puts: Default::default(),
+            listed_strikes: Vec::new(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
         }

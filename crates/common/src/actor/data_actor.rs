@@ -1979,10 +1979,12 @@ pub trait DataActor {
         );
     }
 
-    /// Subscribe to streaming [`OptionChainSlice`] snapshots for the option `series_id`.
+    /// Subscribes to streaming [`OptionChainSlice`] snapshots for `series_id`.
     ///
-    /// The ATM price is always derived from the exchange-provided forward price
-    /// embedded in each option greeks/ticker update.
+    /// ATM is derived from option Greeks `underlying_price`. This is the original
+    /// five-argument path so existing callers do not pass last-trade or Greeks flags.
+    /// For last-trade ATM or to skip option Greeks, use
+    /// [`Self::subscribe_option_chain_with`].
     fn subscribe_option_chain(
         &mut self,
         series_id: OptionSeriesId,
@@ -1990,6 +1992,53 @@ pub trait DataActor {
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
         params: Option<Params>,
+    ) where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        self.subscribe_option_chain_with(
+            series_id,
+            strike_range,
+            snapshot_interval_ms,
+            client_id,
+            params,
+            None,
+            true,
+        );
+    }
+
+    /// Subscribes to option chain snapshots with last-trade ATM and Greeks flags.
+    ///
+    /// When `atm_instrument_id` is set, ATM and strike-window rebalance follow that
+    /// instrument's last trade rather than Greeks `underlying_price`. The engine
+    /// routes those trades by the instrument's venue, not this chain's `client_id`.
+    ///
+    /// When `include_greeks` is `false`, option Greeks are not subscribed, so every
+    /// strike row carries `greeks = None`. Last-trade ATM does not require this to
+    /// be `false`; it only skips a Greeks wire the venue may not provide.
+    ///
+    /// # Notes
+    ///
+    /// The engine logs an error and creates no chain when the strike range can never
+    /// resolve. This call still returns normally; watch the log, not a result:
+    /// - [`StrikeRange::Delta`] with `include_greeks` false.
+    /// - An ATM-based range with `include_greeks` false and no `atm_instrument_id`.
+    /// - An `atm_instrument_id` whose venue has no routing entry.
+    ///
+    /// Python exposes these fields as keyword arguments on `subscribe_option_chain`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "optional ATM and Greeks flags stay off the default subscribe path"
+    )]
+    fn subscribe_option_chain_with(
+        &mut self,
+        series_id: OptionSeriesId,
+        strike_range: StrikeRange,
+        snapshot_interval_ms: Option<u64>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        atm_instrument_id: Option<InstrumentId>,
+        include_greeks: bool,
     ) where
         Self: DataActorNative,
         Self: 'static + Debug + Sized,
@@ -2014,6 +2063,8 @@ pub trait DataActor {
             snapshot_interval_ms,
             client_id,
             params,
+            atm_instrument_id,
+            include_greeks,
         );
     }
 
@@ -4828,6 +4879,10 @@ impl DataActorCore {
     }
 
     /// Subscribes the actor to option chain snapshots.
+    ///
+    /// Last-trade ATM and Greeks flags are applied with
+    /// [`SubscribeOptionChain::with_atm_instrument_id`] and
+    /// [`SubscribeOptionChain::with_include_greeks`].
     #[expect(
         clippy::too_many_arguments,
         reason = "subscription command mirrors the option chain request fields"
@@ -4841,6 +4896,8 @@ impl DataActorCore {
         snapshot_interval_ms: Option<u64>,
         client_id: Option<ClientId>,
         params: Option<Params>,
+        atm_instrument_id: Option<InstrumentId>,
+        include_greeks: bool,
     ) {
         self.check_registered();
 
@@ -4863,7 +4920,9 @@ impl DataActorCore {
             client_id,
             Some(series_id.venue),
             params,
-        );
+        )
+        .with_atm_instrument_id(atm_instrument_id)
+        .with_include_greeks(include_greeks);
         subscribe.correlation_id = correlation_id;
         let command = DataCommand::Subscribe(SubscribeCommand::OptionChain(subscribe));
 

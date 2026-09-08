@@ -26,9 +26,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ustr::Ustr;
 
-use crate::{identifiers::Venue, instruments::CryptoOption};
+use crate::{
+    identifiers::Venue,
+    instruments::{CryptoOption, OptionContract},
+};
 
-/// Identifies a unique option series: a specific venue + underlying + settlement currency + expiration.
+/// Identifies a unique option series: venue + underlying + settlement currency + expiration.
+///
+/// This is the option expiry key the chain manager matches against
+/// [`crate::instruments::OptionContract::expiration_ns`]. It is not the ATM
+/// instrument. Last-trade ATM is a separate `InstrumentId` (for example
+/// `SPY.ARCA`); the series is `VENUE:UNDERLYING:SETTLEMENT:<expiration_ns>`.
+/// Copy `expiration_ns` from catalog contracts via [`Self::from_option_contract`].
+/// [`Self::from_expiry`] with `"YYYY-MM-DD"` is midnight UTC and will not match
+/// a 20:00 NY stamp.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "python",
@@ -103,6 +114,9 @@ impl OptionSeriesId {
     ///
     /// The `date_str` is parsed via `UnixNanos::FromStr`, which accepts `"YYYY-MM-DD"`,
     /// RFC 3339 timestamps, integer nanoseconds, or floating-point seconds.
+    /// `"YYYY-MM-DD"` is midnight UTC, which usually does not match
+    /// `OptionContract.expiration_ns` (often 20:00 `America/New_York`).
+    /// Prefer [`Self::from_option_contract`] so the series key matches the catalog.
     ///
     /// # Errors
     ///
@@ -179,6 +193,20 @@ impl OptionSeriesId {
             venue: option.id.venue,
             underlying: option.underlying.code,
             settlement_currency: option.settlement_currency.code,
+            expiration_ns: option.expiration_ns,
+        }
+    }
+
+    /// Creates an [`OptionSeriesId`] from an [`OptionContract`].
+    ///
+    /// Copies venue, underlying, settlement currency, and `expiration_ns` from the
+    /// contract so the series key matches the catalog the chain manager resolves.
+    #[must_use]
+    pub fn from_option_contract(option: &OptionContract) -> Self {
+        Self {
+            venue: option.id.venue,
+            underlying: option.underlying,
+            settlement_currency: option.currency.code,
             expiration_ns: option.expiration_ns,
         }
     }
@@ -616,5 +644,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(id.to_wire_string(), "DERIBIT:::1700000000000000000");
+    }
+
+    #[rstest]
+    fn test_from_option_contract_copies_catalog_fields() {
+        let contract = crate::instruments::stubs::option_contract_appl();
+        let id = OptionSeriesId::from_option_contract(&contract);
+
+        assert_eq!(id.venue, contract.id.venue);
+        assert_eq!(id.underlying, contract.underlying);
+        assert_eq!(id.settlement_currency, contract.currency.code);
+        assert_eq!(id.expiration_ns, contract.expiration_ns);
+    }
+
+    #[rstest]
+    fn test_from_option_contract_differs_from_calendar_date_midnight_utc() {
+        let mut contract = crate::instruments::stubs::option_contract_appl();
+        // 20:00 America/New_York on 2021-12-17 is not midnight UTC of that date
+        contract.expiration_ns = UnixNanos::from(1_639_800_000_000_000_000u64);
+        let from_contract = OptionSeriesId::from_option_contract(&contract);
+        let from_date = OptionSeriesId::from_expiry("OPRA", "AAPL", "USD", "2021-12-17").unwrap();
+
+        assert_ne!(from_contract.expiration_ns, from_date.expiration_ns);
+        assert_eq!(from_contract.expiration_ns, contract.expiration_ns);
     }
 }

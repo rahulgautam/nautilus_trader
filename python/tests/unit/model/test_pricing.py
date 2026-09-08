@@ -20,16 +20,21 @@ import re
 
 import pytest
 
+from nautilus_trader.model import AssetClass
 from nautilus_trader.model import BlackScholesGreeksResult
+from nautilus_trader.model import Currency
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OptionChainSlice
+from nautilus_trader.model import OptionContract
 from nautilus_trader.model import OptionGreeks
+from nautilus_trader.model import OptionKind
 from nautilus_trader.model import OptionSeriesId
 from nautilus_trader.model import OptionStrikeData
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import StrikeRange
+from nautilus_trader.model import Symbol
 from nautilus_trader.model import Venue
 from nautilus_trader.model import black_scholes_greeks
 from nautilus_trader.model import imply_vol
@@ -49,6 +54,40 @@ def test_option_series_id_from_expiry_and_from_str() -> None:
     assert series_id.settlement_currency == "USD"
     assert restored.value == series_id.value
     assert hash(restored) == hash(series_id)
+
+
+def test_option_series_id_from_option_contract_copies_expiration_ns() -> None:
+    """
+    Test option series id from option contract copies catalog expiration.
+    """
+    # 20:00 America/New_York on 2023-12-15 (not midnight UTC)
+    expiration_ns = 1_702_688_400_000_000_000
+    contract = OptionContract(
+        instrument_id=InstrumentId(Symbol("AAPL231215C00150000"), Venue("OPRA")),
+        raw_symbol=Symbol("AAPL231215C00150000"),
+        underlying="AAPL",
+        asset_class=AssetClass.EQUITY,
+        exchange="OPRA",
+        currency=Currency.from_str("USD"),
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        multiplier=Quantity.from_int(100),
+        lot_size=Quantity.from_int(1),
+        option_kind=OptionKind.CALL,
+        strike_price=Price.from_str("150.00"),
+        activation_ns=1_640_390_400_000_000_000,
+        expiration_ns=expiration_ns,
+        ts_event=0,
+        ts_init=0,
+    )
+    series_id = OptionSeriesId.from_option_contract(contract)
+    from_date = OptionSeriesId.from_expiry("OPRA", "AAPL", "USD", "2023-12-15")
+
+    assert series_id.venue.value == "OPRA"
+    assert series_id.underlying == "AAPL"
+    assert series_id.settlement_currency == "USD"
+    assert series_id.expiration_ns == expiration_ns
+    assert series_id.expiration_ns != from_date.expiration_ns
 
 
 @pytest.mark.parametrize(
@@ -168,6 +207,8 @@ def test_option_chain_slice_empty_state_and_lookups() -> None:
 
     assert chain.series_id == series_id
     assert chain.atm_strike == Price.from_str("50000.0")
+    assert chain.atm_price is None
+    assert chain.atm_instrument_id is None
     assert chain.ts_event == 5
     assert chain.ts_init == 6
     assert chain.is_empty()
@@ -175,12 +216,16 @@ def test_option_chain_slice_empty_state_and_lookups() -> None:
     assert chain.put_count() == 0
     assert chain.strike_count() == 0
     assert chain.strikes() == []
+    assert chain.listed_strikes() == []
     assert chain.get_call(Price.from_str("50000.0")) is None
     assert chain.get_put(Price.from_str("50000.0")) is None
     assert chain.get_call_quote(Price.from_str("50000.0")) is None
     assert chain.get_put_quote(Price.from_str("50000.0")) is None
     assert chain.get_call_greeks(Price.from_str("50000.0")) is None
     assert chain.get_put_greeks(Price.from_str("50000.0")) is None
+    assert chain.get_call_atm_offset(0) is None
+    assert chain.get_call_listed_offset(0) is None
+    assert chain.get_put_listed_offset(0) is None
 
 
 @pytest.mark.parametrize(

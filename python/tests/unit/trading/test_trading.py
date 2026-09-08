@@ -1472,6 +1472,8 @@ OPTION_CHAIN_SUBSCRIPTION_PARAMETERS = (
     "snapshot_interval_ms",
     "client_id",
     "params",
+    "atm_instrument_id",
+    "include_greeks",
 )
 OPTION_CHAIN_UNSUBSCRIBE_PARAMETERS = ("series_id", "client_id")
 INSTRUMENT_REQUEST_PARAMETERS = ("instrument_id", "start", "end", "client_id", "params")

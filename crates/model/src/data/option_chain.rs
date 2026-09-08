@@ -45,7 +45,10 @@ pub(crate) const DEFAULT_DELTA_FALLBACK_STRIKES: usize = 5;
 pub enum StrikeRange {
     /// Subscribe to a fixed set of strike prices.
     Fixed(Vec<Price>),
-    /// Subscribe to strikes relative to ATM: N strikes above and N below.
+    /// Subscribe to N listed strikes above and below ATM.
+    ///
+    /// Steps are taken over the series instruments in cache at subscribe (the
+    /// OCC ladder), not over quoted `OptionChainSlice::strikes()`.
     AtmRelative {
         strikes_above: usize,
         strikes_below: usize,
@@ -270,10 +273,31 @@ pub struct OptionChainSlice {
     pub series_id: OptionSeriesId,
     /// The current ATM strike price (if determined).
     pub atm_strike: Option<Price>,
+    /// The price used to window the chain (Greeks/HTTP reference or last trade).
+    ///
+    /// `None` until ATM is known. This is the tracker price, not a last-trade-only
+    /// field. Last-trade mode is [`Self::atm_instrument_id`] being `Some`.
+    pub atm_price: Option<Price>,
+    /// Last-trade ATM instrument when subscribe set `atm_instrument_id`.
+    ///
+    /// `None` on the Greeks/reference path. Set from subscribe even before the first trade.
+    pub atm_instrument_id: Option<InstrumentId>,
     /// Call option data keyed by strike price (sorted).
     pub calls: BTreeMap<Price, OptionStrikeData>,
     /// Put option data keyed by strike price (sorted).
     pub puts: BTreeMap<Price, OptionStrikeData>,
+    /// Sorted unique strikes from the aggregator catalog (cache at subscribe).
+    ///
+    /// This is the ladder [`StrikeRange::AtmRelative`] steps. Quoted rows in
+    /// [`Self::calls`] / [`Self::puts`] may omit some of these names.
+    ///
+    /// # Invariant
+    ///
+    /// Must be sorted ascending and deduplicated. [`Self::get_call_listed_offset`]
+    /// and [`Self::get_put_listed_offset`] step it by index, so an unsorted vec
+    /// silently resolves the wrong neighbor. The aggregator and the Python
+    /// constructor both uphold this; hand-built slices must too.
+    pub listed_strikes: Vec<Price>,
     /// UNIX timestamp (nanoseconds) when the snapshot event occurred.
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was initialized.
@@ -306,8 +330,11 @@ impl OptionChainSlice {
         Self {
             series_id,
             atm_strike: None,
+            atm_price: None,
+            atm_instrument_id: None,
             calls: BTreeMap::new(),
             puts: BTreeMap::new(),
+            listed_strikes: Vec::new(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
         }
@@ -361,7 +388,11 @@ impl OptionChainSlice {
         self.puts.get(strike).and_then(|d| d.greeks.as_ref())
     }
 
-    /// Returns all strike prices present in the chain (union of calls and puts).
+    /// Returns strike prices that currently have a quoted call or put row.
+    ///
+    /// This is not the full listed series. Missing quotes omit that strike.
+    /// [`Self::get_call_atm_offset`] steps this set. Listed C[+N] / P[-N]
+    /// uses [`Self::get_call_listed_offset`] / [`Self::get_put_listed_offset`].
     #[must_use]
     pub fn strikes(&self) -> Vec<Price> {
         let mut strikes: Vec<Price> = self.calls.keys().chain(self.puts.keys()).copied().collect();
@@ -380,6 +411,100 @@ impl OptionChainSlice {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.calls.is_empty() && self.puts.is_empty()
+    }
+
+    /// Steps `offset` places from [`Self::atm_strike`] along the strikes in this slice.
+    ///
+    /// The anchor is matched exactly, so the ATM strike must itself be present in
+    /// [`Self::strikes`]. See [`Self::get_call_atm_offset`] for when that does not hold.
+    fn strike_at_atm_offset(&self, offset: i32) -> Option<Price> {
+        let atm = self.atm_strike?;
+        let strikes = self.strikes();
+        let atm_idx = strikes.iter().position(|s| *s == atm)?;
+        let target = i32::try_from(atm_idx).ok()?.checked_add(offset)?;
+        let target = usize::try_from(target).ok()?;
+        strikes.get(target).copied()
+    }
+
+    /// Returns call data at `offset` quoted strikes from [`Self::atm_strike`].
+    ///
+    /// `0` is ATM, positive is higher strikes (OTM calls), negative is lower
+    /// strikes (ITM calls). Steps are taken over [`Self::strikes`] (quoted rows
+    /// in this snapshot), not the listed OCC series used by
+    /// [`StrikeRange::AtmRelative`]. For listed C[+N] / P[-N], use
+    /// [`Self::get_call_listed_offset`].
+    ///
+    /// Returns `None` when:
+    /// - [`Self::atm_strike`] is unknown (no ATM price has been established yet).
+    /// - [`Self::atm_strike`] has no row in this slice. It is the closest listed strike
+    ///   across the whole series, so it is absent whenever it falls outside the active
+    ///   strike window (such as a [`StrikeRange::Fixed`] range that excludes it) or has
+    ///   not quoted yet. Every offset resolves to `None` while that is the case.
+    /// - `offset` steps past either end of [`Self::strikes`].
+    /// - The resolved strike has a put row but no call row.
+    #[must_use]
+    pub fn get_call_atm_offset(&self, offset: i32) -> Option<&OptionStrikeData> {
+        self.strike_at_atm_offset(offset)
+            .and_then(|strike| self.get_call(&strike))
+    }
+
+    /// Returns put data at `offset` quoted strikes from [`Self::atm_strike`].
+    ///
+    /// Same quoted-slice stepping as [`Self::get_call_atm_offset`], not listed OCC
+    /// steps. `0` is ATM, negative is lower strikes (OTM puts), positive is higher
+    /// strikes (ITM puts). Returns `None` under the same conditions, with the last
+    /// inverted: the resolved strike has a call row but no put row.
+    #[must_use]
+    pub fn get_put_atm_offset(&self, offset: i32) -> Option<&OptionStrikeData> {
+        self.strike_at_atm_offset(offset)
+            .and_then(|strike| self.get_put(&strike))
+    }
+
+    /// Steps `offset` places from [`Self::atm_strike`] along [`Self::listed_strikes`].
+    ///
+    /// The anchor is an exact match on the catalog ladder, so [`Self::atm_strike`]
+    /// must itself be present in [`Self::listed_strikes`].
+    ///
+    /// When the ATM price falls exactly between two listed strikes, the aggregator
+    /// resolves [`Self::atm_strike`] to the **lower** one, so offsets are anchored
+    /// there.
+    fn strike_at_listed_offset(&self, offset: i32) -> Option<Price> {
+        let atm = self.atm_strike?;
+        let atm_idx = self.listed_strikes.iter().position(|s| *s == atm)?;
+        let target = i32::try_from(atm_idx).ok()?.checked_add(offset)?;
+        let target = usize::try_from(target).ok()?;
+        self.listed_strikes.get(target).copied()
+    }
+
+    /// Returns call data at `offset` listed strikes from [`Self::atm_strike`].
+    ///
+    /// `0` is ATM, positive is higher strikes (OTM calls), negative is lower
+    /// strikes (ITM calls). Steps are taken over [`Self::listed_strikes`] (the
+    /// aggregator catalog, same ladder as [`StrikeRange::AtmRelative`]), then
+    /// [`Self::get_call`]. A missing quote does not skip to the next listed
+    /// strike.
+    ///
+    /// Returns `None` when:
+    /// - [`Self::atm_strike`] is unknown.
+    /// - [`Self::listed_strikes`] is empty, or does not contain [`Self::atm_strike`].
+    /// - `offset` steps past either end of [`Self::listed_strikes`].
+    /// - The listed strike has no call row in this snapshot.
+    #[must_use]
+    pub fn get_call_listed_offset(&self, offset: i32) -> Option<&OptionStrikeData> {
+        self.strike_at_listed_offset(offset)
+            .and_then(|strike| self.get_call(&strike))
+    }
+
+    /// Returns put data at `offset` listed strikes from [`Self::atm_strike`].
+    ///
+    /// Same catalog stepping as [`Self::get_call_listed_offset`]. `0` is ATM,
+    /// negative is lower strikes (OTM puts), positive is higher strikes (ITM
+    /// puts). Returns `None` under the same conditions, with the last inverted:
+    /// the listed strike has no put row in this snapshot.
+    #[must_use]
+    pub fn get_put_listed_offset(&self, offset: i32) -> Option<&OptionStrikeData> {
+        self.strike_at_listed_offset(offset)
+            .and_then(|strike| self.get_put(&strike))
     }
 }
 
@@ -536,8 +661,11 @@ mod tests {
         let slice = OptionChainSlice {
             series_id: make_series_id(),
             atm_strike: None,
+            atm_price: None,
+            atm_instrument_id: None,
             calls: BTreeMap::new(),
             puts: BTreeMap::new(),
+            listed_strikes: Vec::new(),
             ts_event: UnixNanos::from(1u64),
             ts_init: UnixNanos::from(1u64),
         };
@@ -545,6 +673,8 @@ mod tests {
         assert!(slice.is_empty());
         assert_eq!(slice.strike_count(), 0);
         assert!(slice.strikes().is_empty());
+        assert!(slice.listed_strikes.is_empty());
+        assert!(slice.get_call_listed_offset(0).is_none());
     }
 
     #[rstest]
@@ -581,8 +711,11 @@ mod tests {
         let slice = OptionChainSlice {
             series_id: make_series_id(),
             atm_strike: Some(strike),
+            atm_price: None,
+            atm_instrument_id: None,
             calls,
             puts,
+            listed_strikes: vec![strike],
             ts_event: UnixNanos::from(1u64),
             ts_init: UnixNanos::from(1u64),
         };
@@ -597,13 +730,209 @@ mod tests {
         assert_eq!(slice.get_call_greeks(&strike).unwrap().delta, 0.55);
     }
 
+    fn make_strike_pair(strike: Price) -> (Price, OptionStrikeData, OptionStrikeData) {
+        let call_id = InstrumentId::from(&format!("BTC-20240101-{strike}-C.DERIBIT"));
+        let put_id = InstrumentId::from(&format!("BTC-20240101-{strike}-P.DERIBIT"));
+        (
+            strike,
+            OptionStrikeData {
+                quote: make_quote(call_id),
+                greeks: None,
+            },
+            OptionStrikeData {
+                quote: make_quote(put_id),
+                greeks: None,
+            },
+        )
+    }
+
+    fn make_offset_slice(atm_strike: Option<Price>) -> OptionChainSlice {
+        let mut calls = BTreeMap::new();
+        let mut puts = BTreeMap::new();
+
+        for strike in ["49000", "50000", "51000"] {
+            let (strike, call, put) = make_strike_pair(Price::from(strike));
+            calls.insert(strike, call);
+            puts.insert(strike, put);
+        }
+        OptionChainSlice {
+            series_id: make_series_id(),
+            atm_strike,
+            atm_price: None,
+            atm_instrument_id: None,
+            calls,
+            puts,
+            listed_strikes: vec![
+                Price::from("49000"),
+                Price::from("50000"),
+                Price::from("51000"),
+            ],
+            ts_event: UnixNanos::from(1u64),
+            ts_init: UnixNanos::from(1u64),
+        }
+    }
+
+    #[rstest]
+    fn test_option_chain_slice_atm_offset_helpers() {
+        let slice = make_offset_slice(Some(Price::from("50000")));
+
+        assert_eq!(
+            slice.get_call_atm_offset(0).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+        );
+        assert_eq!(
+            slice.get_put_atm_offset(0).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-50000-P.DERIBIT"),
+        );
+        assert_eq!(
+            slice.get_call_atm_offset(1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-51000-C.DERIBIT"),
+        );
+        assert_eq!(
+            slice.get_put_atm_offset(-1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-49000-P.DERIBIT"),
+        );
+        assert!(slice.get_call_atm_offset(2).is_none());
+        assert!(slice.get_put_atm_offset(-2).is_none());
+    }
+
+    #[rstest]
+    fn test_option_chain_slice_atm_offset_none_without_atm() {
+        let slice = make_offset_slice(None);
+        assert!(slice.get_call_atm_offset(0).is_none());
+        assert!(slice.get_put_atm_offset(0).is_none());
+    }
+
+    #[rstest]
+    fn test_option_chain_slice_atm_offset_none_when_atm_off_chain() {
+        let slice = make_offset_slice(Some(Price::from("99999")));
+        assert!(slice.get_call_atm_offset(0).is_none());
+        assert!(slice.get_put_atm_offset(0).is_none());
+    }
+
+    /// `atm_strike` is the closest strike listed for the whole series, so it can name a
+    /// strike with no row in this slice (outside the active window, or not yet quoted).
+    /// Offsets are anchored on an exact match, so all of them resolve to `None`.
+    #[rstest]
+    fn test_option_chain_slice_atm_offset_none_when_atm_strike_absent_from_slice() {
+        let mut slice = make_offset_slice(Some(Price::from("50000")));
+        slice.calls.remove(&Price::from("50000"));
+        slice.puts.remove(&Price::from("50000"));
+
+        assert!(!slice.is_empty());
+        assert!(slice.get_call_atm_offset(0).is_none());
+        assert!(slice.get_call_atm_offset(1).is_none());
+        assert!(slice.get_put_atm_offset(-1).is_none());
+    }
+
+    /// Offsets step over the union of call and put strikes, so a strike listed on only one
+    /// side yields `None` for the other side rather than skipping to the next strike.
+    #[rstest]
+    fn test_option_chain_slice_atm_offset_none_when_side_missing_at_strike() {
+        let mut slice = make_offset_slice(Some(Price::from("50000")));
+        slice.calls.remove(&Price::from("51000"));
+
+        assert!(slice.get_call_atm_offset(1).is_none());
+        assert_eq!(
+            slice.get_put_atm_offset(1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-51000-P.DERIBIT"),
+        );
+    }
+
+    fn make_listed_hole_slice() -> OptionChainSlice {
+        let mut calls = BTreeMap::new();
+        let mut puts = BTreeMap::new();
+
+        for strike in ["49000", "51000", "53000"] {
+            let (strike, call, put) = make_strike_pair(Price::from(strike));
+            calls.insert(strike, call);
+            puts.insert(strike, put);
+        }
+        OptionChainSlice {
+            series_id: make_series_id(),
+            atm_strike: Some(Price::from("50000")),
+            atm_price: Some(Price::from("50000")),
+            atm_instrument_id: None,
+            calls,
+            puts,
+            listed_strikes: vec![
+                Price::from("49000"),
+                Price::from("50000"),
+                Price::from("51000"),
+                Price::from("52000"),
+                Price::from("53000"),
+            ],
+            ts_event: UnixNanos::from(1u64),
+            ts_init: UnixNanos::from(1u64),
+        }
+    }
+
+    /// Quoted offsets fail closed when ATM itself has no row. Listed offsets still
+    /// step the catalog, then `get_call` / `get_put` (missing quote stays `None`).
+    #[rstest]
+    fn test_option_chain_slice_listed_offset_steps_catalog_not_quoted_holes() {
+        let slice = make_listed_hole_slice();
+
+        assert_eq!(
+            slice.strikes(),
+            vec![
+                Price::from("49000"),
+                Price::from("51000"),
+                Price::from("53000"),
+            ],
+        );
+        assert!(slice.get_call_atm_offset(0).is_none());
+        assert!(slice.get_call_atm_offset(1).is_none());
+
+        assert!(slice.get_call_listed_offset(0).is_none());
+        assert_eq!(
+            slice.get_call_listed_offset(1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-51000-C.DERIBIT"),
+        );
+        assert!(slice.get_call_listed_offset(2).is_none());
+        assert_eq!(
+            slice.get_call_listed_offset(3).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-53000-C.DERIBIT"),
+        );
+        assert!(slice.get_call_listed_offset(4).is_none());
+        assert_eq!(
+            slice.get_put_listed_offset(-1).unwrap().quote.instrument_id,
+            InstrumentId::from("BTC-20240101-49000-P.DERIBIT"),
+        );
+    }
+
+    #[rstest]
+    fn test_option_chain_slice_listed_offset_none_without_catalog() {
+        let mut slice = make_offset_slice(Some(Price::from("50000")));
+        slice.listed_strikes.clear();
+        assert!(slice.get_call_listed_offset(0).is_none());
+        assert!(slice.get_put_listed_offset(0).is_none());
+        assert!(slice.get_call_atm_offset(0).is_some());
+    }
+
+    #[rstest]
+    fn test_option_chain_slice_listed_offset_matches_quoted_when_catalog_is_dense() {
+        let slice = make_offset_slice(Some(Price::from("50000")));
+        assert_eq!(
+            slice.get_call_listed_offset(1).unwrap().quote.instrument_id,
+            slice.get_call_atm_offset(1).unwrap().quote.instrument_id,
+        );
+        assert_eq!(
+            slice.get_put_listed_offset(-1).unwrap().quote.instrument_id,
+            slice.get_put_atm_offset(-1).unwrap().quote.instrument_id,
+        );
+    }
+
     #[rstest]
     fn test_option_chain_slice_display() {
         let slice = OptionChainSlice {
             series_id: make_series_id(),
             atm_strike: None,
+            atm_price: None,
+            atm_instrument_id: None,
             calls: BTreeMap::new(),
             puts: BTreeMap::new(),
+            listed_strikes: Vec::new(),
             ts_event: UnixNanos::from(1u64),
             ts_init: UnixNanos::from(1u64),
         };
@@ -618,8 +947,11 @@ mod tests {
         let slice = OptionChainSlice {
             series_id: make_series_id(),
             atm_strike: None,
+            atm_price: None,
+            atm_instrument_id: None,
             calls: BTreeMap::new(),
             puts: BTreeMap::new(),
+            listed_strikes: Vec::new(),
             ts_event: UnixNanos::from(1u64),
             ts_init: UnixNanos::from(42u64),
         };

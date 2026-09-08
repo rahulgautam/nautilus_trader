@@ -271,18 +271,27 @@ impl OptionStrikeData {
 impl OptionChainSlice {
     /// A point-in-time snapshot of an option chain for a single series.
     #[new]
-    #[pyo3(signature = (series_id, atm_strike=None, ts_event=0, ts_init=0))]
+    #[pyo3(signature = (series_id, atm_strike=None, ts_event=0, ts_init=0, atm_price=None, atm_instrument_id=None, listed_strikes=None))]
     fn py_new(
         series_id: OptionSeriesId,
         atm_strike: Option<Price>,
         ts_event: u64,
         ts_init: u64,
+        atm_price: Option<Price>,
+        atm_instrument_id: Option<InstrumentId>,
+        listed_strikes: Option<Vec<Price>>,
     ) -> Self {
+        let mut listed_strikes = listed_strikes.unwrap_or_default();
+        listed_strikes.sort();
+        listed_strikes.dedup();
         Self {
             series_id,
             atm_strike,
+            atm_price,
+            atm_instrument_id,
             calls: BTreeMap::new(),
             puts: BTreeMap::new(),
+            listed_strikes,
             ts_event: UnixNanos::from(ts_event),
             ts_init: UnixNanos::from(ts_init),
         }
@@ -298,6 +307,20 @@ impl OptionChainSlice {
     #[pyo3(name = "atm_strike")]
     fn py_atm_strike(&self) -> Option<Price> {
         self.atm_strike
+    }
+
+    /// Price used to window the chain (Greeks/HTTP reference or last trade).
+    #[getter]
+    #[pyo3(name = "atm_price")]
+    fn py_atm_price(&self) -> Option<Price> {
+        self.atm_price
+    }
+
+    /// Last-trade ATM instrument, or `None` on the Greeks/reference path.
+    #[getter]
+    #[pyo3(name = "atm_instrument_id")]
+    fn py_atm_instrument_id(&self) -> Option<InstrumentId> {
+        self.atm_instrument_id
     }
 
     #[getter]
@@ -336,10 +359,23 @@ impl OptionChainSlice {
         self.is_empty()
     }
 
-    /// Returns all strike prices present in the chain (union of calls and puts).
+    /// Returns strike prices that currently have a quoted call or put row.
+    ///
+    /// This is not the full listed series. Missing quotes omit that strike.
+    /// `Self.get_call_atm_offset` steps this set. Listed C[+N] / P[-N]
+    /// uses `Self.get_call_listed_offset` / `Self.get_put_listed_offset`.
     #[pyo3(name = "strikes")]
     fn py_strikes(&self) -> Vec<Price> {
         self.strikes()
+    }
+
+    /// Returns the catalog strikes stamped by the aggregator (not only quoted rows).
+    ///
+    /// Sorted ascending. This is the ladder `Self.get_call_listed_offset` steps,
+    /// the same one `StrikeRange.AtmRelative` resolves against.
+    #[pyo3(name = "listed_strikes")]
+    fn py_listed_strikes(&self) -> Vec<Price> {
+        self.listed_strikes.clone()
     }
 
     /// Returns the call data for a given strike price.
@@ -376,6 +412,67 @@ impl OptionChainSlice {
     #[pyo3(name = "get_put_greeks")]
     fn py_get_put_greeks(&self, strike: Price) -> Option<OptionGreeks> {
         self.get_put_greeks(&strike).copied()
+    }
+
+    /// Returns call data at `offset` quoted strikes from `Self.atm_strike`.
+    ///
+    /// `0` is ATM, positive is higher strikes (OTM calls), negative is lower
+    /// strikes (ITM calls). Steps are taken over `Self.strikes` (quoted rows
+    /// in this snapshot), not the listed OCC series used by
+    /// `StrikeRange.AtmRelative`. For listed C[+N] / P[-N], use
+    /// `Self.get_call_listed_offset`.
+    ///
+    /// Returns `None` when:
+    /// - `Self.atm_strike` is unknown (no ATM price has been established yet).
+    /// - `Self.atm_strike` has no row in this slice. It is the closest listed strike
+    ///   across the whole series, so it is absent whenever it falls outside the active
+    ///   strike window (such as a `StrikeRange.Fixed` range that excludes it) or has
+    ///   not quoted yet. Every offset resolves to `None` while that is the case.
+    /// - `offset` steps past either end of `Self.strikes`.
+    /// - The resolved strike has a put row but no call row.
+    #[pyo3(name = "get_call_atm_offset")]
+    fn py_get_call_atm_offset(&self, offset: i32) -> Option<OptionStrikeData> {
+        self.get_call_atm_offset(offset).cloned()
+    }
+
+    /// Returns put data at `offset` quoted strikes from `Self.atm_strike`.
+    ///
+    /// Same quoted-slice stepping as `Self.get_call_atm_offset`, not listed OCC
+    /// steps. `0` is ATM, negative is lower strikes (OTM puts), positive is higher
+    /// strikes (ITM puts). Returns `None` under the same conditions, with the last
+    /// inverted: the resolved strike has a call row but no put row.
+    #[pyo3(name = "get_put_atm_offset")]
+    fn py_get_put_atm_offset(&self, offset: i32) -> Option<OptionStrikeData> {
+        self.get_put_atm_offset(offset).cloned()
+    }
+
+    /// Returns call data at `offset` listed strikes from `Self.atm_strike`.
+    ///
+    /// `0` is ATM, positive is higher strikes (OTM calls), negative is lower
+    /// strikes (ITM calls). Steps are taken over `Self.listed_strikes` (the
+    /// aggregator catalog, same ladder as `StrikeRange.AtmRelative`), then
+    /// `Self.get_call`. A missing quote does not skip to the next listed
+    /// strike.
+    ///
+    /// Returns `None` when:
+    /// - `Self.atm_strike` is unknown.
+    /// - `Self.listed_strikes` is empty, or does not contain `Self.atm_strike`.
+    /// - `offset` steps past either end of `Self.listed_strikes`.
+    /// - The listed strike has no call row in this snapshot.
+    #[pyo3(name = "get_call_listed_offset")]
+    fn py_get_call_listed_offset(&self, offset: i32) -> Option<OptionStrikeData> {
+        self.get_call_listed_offset(offset).cloned()
+    }
+
+    /// Returns put data at `offset` listed strikes from `Self.atm_strike`.
+    ///
+    /// Same catalog stepping as `Self.get_call_listed_offset`. `0` is ATM,
+    /// negative is lower strikes (OTM puts), positive is higher strikes (ITM
+    /// puts). Returns `None` under the same conditions, with the last inverted:
+    /// the listed strike has no put row in this snapshot.
+    #[pyo3(name = "get_put_listed_offset")]
+    fn py_get_put_listed_offset(&self, offset: i32) -> Option<OptionStrikeData> {
+        self.get_put_listed_offset(offset).cloned()
     }
 
     fn __repr__(&self) -> String {

@@ -576,6 +576,14 @@ impl SubscribeInstrumentClose {
     }
 }
 
+fn default_include_greeks() -> bool {
+    true
+}
+
+/// Command to subscribe to aggregated option chain snapshots for a series.
+///
+/// Construct with [`Self::new`], then [`Self::with_atm_instrument_id`] for
+/// last-trade ATM and [`Self::with_include_greeks`] to skip the Greeks wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubscribeOptionChain {
     pub series_id: OptionSeriesId,
@@ -588,6 +596,17 @@ pub struct SubscribeOptionChain {
     #[serde(default)]
     pub correlation_id: Option<UUID4>,
     pub params: Option<Params>,
+    /// When set, ATM and strike-window rebalance follow this instrument's last trade.
+    #[serde(default)]
+    pub atm_instrument_id: Option<InstrumentId>,
+    /// When `false`, the manager does not subscribe option Greeks.
+    ///
+    /// Rows still need option quotes; every row then has `greeks = None`.
+    /// Last-trade ATM does not require this to be `false`. Turning Greeks off
+    /// without `atm_instrument_id` or [`StrikeRange::Fixed`] leaves an ATM-based
+    /// range with no ATM source.
+    #[serde(default = "default_include_greeks")]
+    pub include_greeks: bool,
 }
 
 impl SubscribeOptionChain {
@@ -617,6 +636,27 @@ impl SubscribeOptionChain {
             venue,
             correlation_id: None,
             params,
+            atm_instrument_id: None,
+            include_greeks: true,
         }
+    }
+
+    /// Sets the instrument whose last trade drives ATM and the strike window.
+    ///
+    /// Pass `None` to keep the default Greeks `underlying_price` ATM source.
+    #[must_use]
+    pub const fn with_atm_instrument_id(mut self, atm_instrument_id: Option<InstrumentId>) -> Self {
+        self.atm_instrument_id = atm_instrument_id;
+        self
+    }
+
+    /// Sets whether the manager subscribes option Greeks for chain rows.
+    ///
+    /// Defaults to `true` from [`Self::new`]. Independent of last-trade ATM.
+    /// [`StrikeRange::Delta`] requires Greeks.
+    #[must_use]
+    pub const fn with_include_greeks(mut self, include_greeks: bool) -> Self {
+        self.include_greeks = include_greeks;
+        self
     }
 }

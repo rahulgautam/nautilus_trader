@@ -776,6 +776,8 @@ class Strategy:
         snapshot_interval_ms: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
+        atm_instrument_id: model.InstrumentId | None = None,
+        include_greeks: bool = True,
     ) -> None: ...
     def unsubscribe_data(
         self,

@@ -35,7 +35,7 @@ use nautilus_common::{
 };
 use nautilus_core::{DurationNanos, UUID4, correctness::FAILED};
 use nautilus_model::{
-    data::{QuoteTick, option_chain::OptionGreeks},
+    data::{QuoteTick, TradeTick, option_chain::OptionGreeks},
     enums::OptionKind,
     identifiers::{ClientId, InstrumentId, OptionSeriesId, Venue},
     instruments::Instrument,
@@ -45,7 +45,10 @@ use ustr::Ustr;
 
 use super::{
     AtmTracker, OptionChainAggregator,
-    handlers::{OptionChainGreeksHandler, OptionChainQuoteHandler, OptionChainSlicePublisher},
+    handlers::{
+        OptionChainGreeksHandler, OptionChainQuoteHandler, OptionChainSlicePublisher,
+        OptionChainTradeHandler,
+    },
 };
 use crate::{
     client::DataClientAdapter,
@@ -63,6 +66,7 @@ pub struct OptionChainManager {
     topic: MStr<Topic>,
     quote_handlers: Vec<TypedHandler<QuoteTick>>,
     greeks_handlers: Vec<TypedHandler<OptionGreeks>>,
+    trade_handlers: Vec<TypedHandler<TradeTick>>,
     timer_name: Option<Ustr>,
     msgbus_priority: u32,
     /// Whether the first ATM price has been received and the active set bootstrapped.
@@ -74,6 +78,10 @@ pub struct OptionChainManager {
     client_id: Option<ClientId>,
     /// When `true`, every quote/greeks update for an active instrument immediately publishes a snapshot.
     raw_mode: bool,
+    /// Optional instrument whose last trade drives ATM.
+    atm_instrument_id: Option<InstrumentId>,
+    /// When `false`, option Greeks are not subscribed.
+    include_greeks: bool,
 }
 
 impl OptionChainManager {
@@ -105,9 +113,19 @@ impl OptionChainManager {
             tracker.set_forward_precision(strike.precision);
         }
 
-        if let Some(price) = initial_atm_price {
+        // The two ATM sources are mutually exclusive: a configured ATM instrument owns the
+        // price, so `handle_greeks` never applies a Greeks/reference update once it is set.
+        if let Some(atm_id) = cmd.atm_instrument_id {
+            if let Some(trade) = cache.borrow().trade(&atm_id) {
+                tracker.set_initial_price(trade.price);
+                log::info!(
+                    "Pre-populated ATM from last trade of {atm_id}: {}",
+                    trade.price
+                );
+            }
+        } else if let Some(price) = initial_atm_price {
             tracker.set_initial_price(price);
-            log::info!("Pre-populated ATM with forward price: {price}");
+            log::info!("Pre-populated ATM with reference price: {price}");
         }
         let aggregator =
             OptionChainAggregator::new(series_id, cmd.strike_range.clone(), tracker, instruments);
@@ -126,6 +144,7 @@ impl OptionChainManager {
             topic,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
+            trade_handlers: Vec::new(),
             timer_name: None,
             msgbus_priority,
             bootstrapped,
@@ -133,6 +152,8 @@ impl OptionChainManager {
             clock: clock.clone(),
             client_id,
             raw_mode,
+            atm_instrument_id: cmd.atm_instrument_id,
+            include_greeks: cmd.include_greeks,
         };
         let manager_rc = Rc::new(RefCell::new(manager));
 
@@ -143,12 +164,22 @@ impl OptionChainManager {
             series_id,
             msgbus_priority,
         );
-        let greeks_handlers = Self::register_greeks_handlers(
-            &manager_rc,
-            &active_instrument_ids,
-            series_id,
-            msgbus_priority,
-        );
+        let greeks_handlers = if cmd.include_greeks {
+            Self::register_greeks_handlers(
+                &manager_rc,
+                &active_instrument_ids,
+                series_id,
+                msgbus_priority,
+            )
+        } else {
+            Vec::new()
+        };
+
+        let trade_handlers = if let Some(atm_id) = cmd.atm_instrument_id {
+            Self::register_trade_handler(&manager_rc, atm_id, series_id, msgbus_priority)
+        } else {
+            Vec::new()
+        };
 
         // Forward wire-level subscriptions for the active set.
         // When ATM is unknown, active set is empty - deferred until bootstrap.
@@ -168,6 +199,7 @@ impl OptionChainManager {
             let mut mgr = manager_rc.borrow_mut();
             mgr.quote_handlers = quote_handlers;
             mgr.greeks_handlers = greeks_handlers;
+            mgr.trade_handlers = trade_handlers;
             mgr.timer_name = timer_name;
         }
 
@@ -231,6 +263,18 @@ impl OptionChainManager {
         handlers
     }
 
+    fn register_trade_handler(
+        manager_rc: &Rc<RefCell<Self>>,
+        atm_instrument_id: InstrumentId,
+        series_id: OptionSeriesId,
+        priority: u32,
+    ) -> Vec<TypedHandler<TradeTick>> {
+        let trade_handler = TypedHandler::new(OptionChainTradeHandler::new(manager_rc, series_id));
+        let topic = switchboard::get_trades_topic(atm_instrument_id);
+        msgbus::subscribe_trades(topic.into(), trade_handler.clone(), Some(priority));
+        vec![trade_handler]
+    }
+
     /// Forwards subscribe commands to the data client for all instruments.
     fn forward_client_subscriptions(
         client: Option<&mut DataClientAdapter>,
@@ -258,17 +302,21 @@ impl OptionChainManager {
                 correlation_id: None,
                 params: None,
             }));
-            client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
-                SubscribeOptionGreeks {
-                    instrument_id: *instrument_id,
-                    client_id: cmd.client_id,
-                    venue: Some(venue),
-                    command_id: UUID4::new(),
-                    ts_init,
-                    correlation_id: None,
-                    params: None,
-                },
-            ));
+
+            if cmd.include_greeks {
+                client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
+                    SubscribeOptionGreeks {
+                        instrument_id: *instrument_id,
+                        client_id: cmd.client_id,
+                        venue: Some(venue),
+                        command_id: UUID4::new(),
+                        ts_init,
+                        correlation_id: None,
+                        params: None,
+                    },
+                ));
+            }
+
             client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
                 SubscribeInstrumentStatus {
                     instrument_id: *instrument_id,
@@ -283,8 +331,9 @@ impl OptionChainManager {
         }
 
         log::info!(
-            "Forwarded {} quote + greeks + instrument status subscriptions to DataClient",
+            "Forwarded {} quote{} + instrument status subscriptions to DataClient",
             instrument_ids.len(),
+            if cmd.include_greeks { " + greeks" } else { "" },
         );
     }
 
@@ -383,12 +432,32 @@ impl OptionChainManager {
 
         self.quote_handlers.clear();
         self.greeks_handlers.clear();
+
+        if let (Some(atm_id), Some(handler)) = (self.atm_instrument_id, self.trade_handlers.first())
+        {
+            let topic = switchboard::get_trades_topic(atm_id);
+            msgbus::unsubscribe_trades(topic.into(), handler);
+        }
+        self.trade_handlers.clear();
+    }
+
+    /// Returns the ATM instrument whose last trade drives this chain, if any.
+    #[must_use]
+    pub const fn atm_instrument_id(&self) -> Option<InstrumentId> {
+        self.atm_instrument_id
+    }
+
+    /// Returns whether this chain subscribed option Greeks.
+    #[must_use]
+    pub const fn include_greeks(&self) -> bool {
+        self.include_greeks
     }
 
     /// Routes incoming greeks to the aggregator.
     ///
-    /// Also updates the ATM tracker from the reference price when one is available,
-    /// and triggers deferred bootstrap on the first arrival.
+    /// Also updates the ATM tracker from the reference price when no
+    /// `atm_instrument_id` is configured, and triggers deferred bootstrap on the
+    /// first arrival.
     pub fn handle_greeks(&mut self, greeks: &OptionGreeks) {
         if self.aggregator.is_expired(greeks.ts_event) {
             log::warn!(
@@ -402,10 +471,12 @@ impl OptionChainManager {
             return;
         }
 
-        if let Err(e) = self
-            .aggregator
-            .atm_tracker_mut()
-            .try_update_from_option_greeks(greeks)
+        // A configured ATM instrument owns the price; Greeks must not overwrite it
+        if self.atm_instrument_id.is_none()
+            && let Err(e) = self
+                .aggregator
+                .atm_tracker_mut()
+                .try_update_from_option_greeks(greeks)
         {
             log::warn!(
                 "Dropping greeks for {}: invalid forward price: {e}",
@@ -462,10 +533,7 @@ impl OptionChainManager {
         self.aggregator.is_catalog_empty()
     }
 
-    /// Routes an incoming quote tick to the aggregator, then bootstraps if ready.
-    ///
-    /// This handles both option instrument quotes (aggregator) and ATM source quotes
-    /// (the aggregator's ATM tracker handles filtering internally).
+    /// Routes an incoming option quote tick to the aggregator, then bootstraps if ready.
     pub fn handle_quote(&mut self, quote: &QuoteTick) {
         if self.aggregator.is_expired(quote.ts_event) {
             log::warn!(
@@ -487,6 +555,52 @@ impl OptionChainManager {
             && self.aggregator.active_ids().contains(&quote.instrument_id)
         {
             self.publish_slice(quote.ts_event);
+        }
+    }
+
+    /// Routes an incoming ATM-instrument last trade into ATM tracking.
+    ///
+    /// The ATM instrument is not part of the chain, so an expired series is torn down
+    /// as a whole rather than expiring a single instrument.
+    pub fn handle_trade(&mut self, trade: &TradeTick) {
+        let Some(atm_id) = self.atm_instrument_id else {
+            return;
+        };
+
+        if trade.instrument_id != atm_id {
+            return;
+        }
+
+        if self.aggregator.is_expired(trade.ts_event) {
+            log::warn!(
+                "Dropping ATM trade for {atm_id}, series {} expired",
+                self.aggregator.series_id(),
+            );
+            self.deferred_cmd_queue
+                .borrow_mut()
+                .push_back(DeferredCommand::ExpireSeries(self.aggregator.series_id()));
+            return;
+        }
+
+        // An unchanged price cannot shift the window, so skip the rebalance and republish
+        if !self
+            .aggregator
+            .atm_tracker_mut()
+            .update_from_price(trade.price)
+            && self.bootstrapped
+        {
+            return;
+        }
+
+        self.maybe_bootstrap();
+
+        if self.raw_mode {
+            // `publish_slice` rebalances before snapshotting
+            if self.bootstrapped {
+                self.publish_slice(trade.ts_event);
+            }
+        } else {
+            self.maybe_rebalance(trade.ts_event);
         }
     }
 
@@ -549,7 +663,13 @@ impl OptionChainManager {
         }
 
         let venue = self.aggregator.series_id().venue;
-        Self::forward_instrument_subscriptions(client, instrument_id, venue, clock);
+        Self::forward_instrument_subscriptions(
+            client,
+            instrument_id,
+            venue,
+            clock,
+            self.include_greeks,
+        );
 
         log::info!(
             "Added instrument {instrument_id} to option chain {} (active={})",
@@ -588,17 +708,21 @@ impl OptionChainManager {
                 params: None,
             },
         )));
-        queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
-            SubscribeOptionGreeks {
-                instrument_id,
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            },
-        )));
+
+        if self.include_greeks {
+            queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
+                SubscribeOptionGreeks {
+                    instrument_id,
+                    client_id: self.client_id,
+                    venue: Some(venue),
+                    command_id: UUID4::new(),
+                    ts_init,
+                    correlation_id: None,
+                    params: None,
+                },
+            )));
+        }
+
         queue.push_back(DeferredCommand::Subscribe(
             SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
                 instrument_id,
@@ -628,17 +752,21 @@ impl OptionChainManager {
                 params: None,
             },
         )));
-        queue.push_back(DeferredCommand::Unsubscribe(
-            UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
-                instrument_id,
-                client_id: self.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }),
-        ));
+
+        if self.include_greeks {
+            queue.push_back(DeferredCommand::Unsubscribe(
+                UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
+                    instrument_id,
+                    client_id: self.client_id,
+                    venue: Some(venue),
+                    command_id: UUID4::new(),
+                    ts_init,
+                    correlation_id: None,
+                    params: None,
+                }),
+            ));
+        }
+
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
                 instrument_id,
@@ -658,6 +786,7 @@ impl OptionChainManager {
         instrument_id: InstrumentId,
         venue: Venue,
         clock: &Rc<RefCell<dyn Clock>>,
+        include_greeks: bool,
     ) {
         let Some(client) = client else {
             log::error!(
@@ -677,15 +806,21 @@ impl OptionChainManager {
             correlation_id: None,
             params: None,
         }));
-        client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
-            instrument_id,
-            client_id: None,
-            venue: Some(venue),
-            command_id: UUID4::new(),
-            ts_init,
-            correlation_id: None,
-            params: None,
-        }));
+
+        if include_greeks {
+            client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
+                SubscribeOptionGreeks {
+                    instrument_id,
+                    client_id: None,
+                    venue: Some(venue),
+                    command_id: UUID4::new(),
+                    ts_init,
+                    correlation_id: None,
+                    params: None,
+                },
+            ));
+        }
+
         client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
             SubscribeInstrumentStatus {
                 instrument_id,
@@ -777,7 +912,8 @@ impl OptionChainManager {
         self.maybe_rebalance(ts);
 
         let series_id = self.aggregator.series_id();
-        let slice = self.aggregator.snapshot(ts);
+        let mut slice = self.aggregator.snapshot(ts);
+        slice.atm_instrument_id = self.atm_instrument_id;
 
         if slice.is_empty() {
             log::debug!("OptionChainSlice empty for {series_id}, skipping publish");
@@ -794,6 +930,11 @@ impl OptionChainManager {
     }
 
     /// Resolves instruments from cache that match the given option series.
+    ///
+    /// This set is the listed ladder: ATM-relative windows and nearest-listed
+    /// ATM strike use only contracts present here at subscribe. Quote streams
+    /// do not add names later. Extra definitions must be in cache before
+    /// `subscribe_option_chain` (engine `add_instrument` or a live adapter).
     fn resolve_instruments(
         cache: &Rc<RefCell<Cache>>,
         series_id: &OptionSeriesId,
@@ -835,7 +976,12 @@ mod tests {
 
     use nautilus_common::clock::TestClock;
     use nautilus_core::UnixNanos;
-    use nautilus_model::{data::option_chain::StrikeRange, identifiers::Venue, types::Quantity};
+    use nautilus_model::{
+        data::{TradeTick, option_chain::StrikeRange},
+        enums::AggressorSide,
+        identifiers::{TradeId, Venue},
+        types::Quantity,
+    };
     use rstest::*;
 
     use super::*;
@@ -871,6 +1017,7 @@ mod tests {
             topic,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
+            trade_handlers: Vec::new(),
             timer_name: None,
             msgbus_priority: 0,
             bootstrapped: true,
@@ -878,6 +1025,8 @@ mod tests {
             clock,
             client_id: None,
             raw_mode: false,
+            atm_instrument_id: None,
+            include_greeks: true,
         };
         (manager, queue)
     }
@@ -948,6 +1097,7 @@ mod tests {
             topic,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
+            trade_handlers: Vec::new(),
             timer_name: None,
             msgbus_priority: 0,
             bootstrapped: false,
@@ -955,6 +1105,8 @@ mod tests {
             clock,
             client_id: None,
             raw_mode: false,
+            atm_instrument_id: None,
+            include_greeks: true,
         };
         (manager, queue)
     }
@@ -1104,6 +1256,100 @@ mod tests {
         assert!(!manager.bootstrapped);
     }
 
+    fn make_last_trade(instrument_id: InstrumentId, price: Price) -> TradeTick {
+        TradeTick::new(
+            instrument_id,
+            price,
+            Quantity::from("1.0"),
+            AggressorSide::Buy,
+            TradeId::new("1"),
+            UnixNanos::from(1u64),
+            UnixNanos::from(1u64),
+        )
+    }
+
+    #[rstest]
+    fn test_manager_last_trade_bootstraps_and_ignores_greeks() {
+        use nautilus_model::data::option_chain::OptionGreeks;
+
+        let (mut manager, queue) = make_option_chain_manager();
+        let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        manager.atm_instrument_id = Some(atm_id);
+        manager.include_greeks = false;
+
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            underlying_price: Some(50000.0),
+            ..Default::default()
+        };
+        manager.handle_greeks(&greeks);
+        assert!(!manager.bootstrapped);
+        assert!(manager.aggregator.atm_tracker().atm_price().is_none());
+        assert!(queue.borrow().is_empty());
+
+        manager.handle_trade(&make_last_trade(atm_id, Price::from("50000")));
+        assert!(manager.bootstrapped);
+        assert_eq!(
+            manager.aggregator.atm_tracker().atm_price().unwrap(),
+            Price::from("50000")
+        );
+        // 6 instruments × 2 commands (quotes + instrument status), no greeks
+        assert_eq!(queue.borrow().len(), 12);
+    }
+
+    /// The ATM instrument is not part of the chain, so an expired series is torn down
+    /// whole rather than expiring the ATM instrument.
+    #[rstest]
+    fn test_manager_last_trade_at_expiry_pushes_expire_series() {
+        let (mut manager, queue) = make_option_chain_manager();
+        let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        manager.atm_instrument_id = Some(atm_id);
+
+        let expiry_ns = manager.aggregator.series_id().expiration_ns;
+        let mut trade = make_last_trade(atm_id, Price::from("50000"));
+        trade.ts_event = expiry_ns;
+        manager.handle_trade(&trade);
+
+        let cmds: Vec<_> = queue.borrow().iter().cloned().collect();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], DeferredCommand::ExpireSeries(_)));
+        assert!(manager.aggregator.atm_tracker().atm_price().is_none());
+    }
+
+    /// An unchanged price cannot move the strike window, so it must not churn subscriptions.
+    #[rstest]
+    fn test_manager_repeated_last_trade_price_does_not_rebalance() {
+        let (mut manager, queue) = make_option_chain_manager();
+        let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        manager.atm_instrument_id = Some(atm_id);
+
+        manager.handle_trade(&make_last_trade(atm_id, Price::from("50000")));
+        assert!(manager.bootstrapped);
+        queue.borrow_mut().clear();
+
+        manager.handle_trade(&make_last_trade(atm_id, Price::from("50000")));
+
+        assert!(queue.borrow().is_empty());
+        assert_eq!(
+            manager.aggregator.atm_tracker().atm_price().unwrap(),
+            Price::from("50000")
+        );
+    }
+
+    #[rstest]
+    fn test_manager_last_trade_ignores_other_instruments() {
+        let (mut manager, queue) = make_option_chain_manager();
+        let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        manager.atm_instrument_id = Some(atm_id);
+
+        manager.handle_trade(&make_last_trade(
+            InstrumentId::from("ETH-PERPETUAL.DERIBIT"),
+            Price::from("50000"),
+        ));
+        assert!(!manager.bootstrapped);
+        assert!(queue.borrow().is_empty());
+    }
+
     #[rstest]
     fn test_manager_forward_price_rejects_invalid_underlying() {
         use nautilus_model::data::option_chain::OptionGreeks;
@@ -1220,6 +1466,7 @@ mod tests {
             topic,
             quote_handlers: Vec::new(),
             greeks_handlers: Vec::new(),
+            trade_handlers: Vec::new(),
             timer_name: None,
             msgbus_priority: 0,
             bootstrapped: true,
@@ -1227,6 +1474,8 @@ mod tests {
             clock,
             client_id: None,
             raw_mode: false,
+            atm_instrument_id: None,
+            include_greeks: true,
         };
 
         let is_empty = manager.handle_instrument_expired(&call_id);

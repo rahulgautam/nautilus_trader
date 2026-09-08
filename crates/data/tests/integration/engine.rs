@@ -5598,8 +5598,11 @@ fn test_backtest_client_overrides_when_registered_as_default(
         &mut data_engine,
     );
 
-    // `BacktestEngine` registers BACKTEST with venue=None, which lands the
-    // adapter in `default_client` rather than `clients`
+    // The `BACKTEST` override keys off the client *name* in `clients`; both
+    // `register_client` and `register_default_client` insert there, and
+    // `default_client_id` is just an index into that map. Note `BacktestEngine`
+    // itself registers venue-named clients (`add_market_data_client_if_not_exists`),
+    // so this shape is a live-style mock, not what a backtest builds.
     let backtest_recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     let backtest = MockDataClient::new_with_recorder(
         clock,
@@ -16655,6 +16658,1426 @@ enum OptionGreeksDispatch {
     DataOwned,
     TypedAny,
     DataBorrowed,
+}
+
+#[rstest]
+fn test_subscribe_option_chain_include_greeks_false_skips_greeks_subs(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let strikes = ["45000.000", "50000.000", "55000.000"];
+    for strike in &strikes {
+        let call = make_btc_option(strike, OptionKind::Call);
+        let put = make_btc_option(strike, OptionKind::Put);
+        let _ = cache.borrow_mut().add_instrument(call);
+        let _ = cache.borrow_mut().add_instrument(put);
+    }
+
+    let series_id = make_series_id();
+    let strike_prices: Vec<Price> = strikes.iter().map(|s| Price::from(*s)).collect();
+    let cmd = SubscribeOptionChain::new(
+        series_id,
+        StrikeRange::Fixed(strike_prices),
+        Some(1000),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(client_id),
+        Some(venue),
+        None,
+    )
+    .with_atm_instrument_id(None)
+    .with_include_greeks(false);
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    let recorded = recorder.borrow();
+    let quote_subs = recorded
+        .iter()
+        .filter(|cmd| matches!(cmd, DataCommand::Subscribe(SubscribeCommand::Quotes(_))))
+        .count();
+    let greeks_subs = recorded
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                DataCommand::Subscribe(SubscribeCommand::OptionGreeks(_))
+            )
+        })
+        .count();
+
+    assert_eq!(quote_subs, 6, "Expected 6 quote subscriptions");
+    assert_eq!(greeks_subs, 0, "Greeks subscriptions should be skipped");
+}
+
+#[rstest]
+fn test_subscribe_option_chain_last_trade_atm_skips_reference_price_and_drains_quotes(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let strikes = ["45000.000", "50000.000", "55000.000"];
+    for strike in &strikes {
+        let call = make_btc_option(strike, OptionKind::Call);
+        let put = make_btc_option(strike, OptionKind::Put);
+        let _ = cache.borrow_mut().add_instrument(call);
+        let _ = cache.borrow_mut().add_instrument(put);
+    }
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    let cmd = SubscribeOptionChain::new(
+        series_id,
+        StrikeRange::AtmRelative {
+            strikes_above: 1,
+            strikes_below: 1,
+        },
+        Some(1000),
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(client_id),
+        Some(venue),
+        None,
+    )
+    .with_atm_instrument_id(Some(atm_id))
+    .with_include_greeks(false);
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    {
+        let recorded = recorder.borrow();
+        let reference_price_requests = recorded
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    DataCommand::Request(RequestCommand::OptionChainReferencePrice(_))
+                )
+            })
+            .count();
+        let trade_subs = recorded
+            .iter()
+            .filter(|cmd| matches!(cmd, DataCommand::Subscribe(SubscribeCommand::Trades(_))))
+            .count();
+        let quote_subs = recorded
+            .iter()
+            .filter(|cmd| matches!(cmd, DataCommand::Subscribe(SubscribeCommand::Quotes(_))))
+            .count();
+        let greeks_subs = recorded
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    DataCommand::Subscribe(SubscribeCommand::OptionGreeks(_))
+                )
+            })
+            .count();
+
+        assert_eq!(
+            reference_price_requests, 0,
+            "Last-trade ATM should skip the HTTP reference price request"
+        );
+        assert_eq!(trade_subs, 1, "Expected ATM last-trade subscription");
+        assert_eq!(quote_subs, 0, "Quotes deferred until last trade arrives");
+        assert_eq!(greeks_subs, 0, "Greeks subscriptions should be skipped");
+    }
+
+    recorder.borrow_mut().clear();
+
+    let trade = TradeTick::new(
+        atm_id,
+        Price::from("50000.000"),
+        Quantity::from("1"),
+        AggressorSide::Buy,
+        TradeId::new("1"),
+        UnixNanos::from(1u64),
+        UnixNanos::from(1u64),
+    );
+    data_engine.borrow_mut().process_data(Data::Trade(trade));
+
+    let recorded = recorder.borrow();
+    let quote_subs = recorded
+        .iter()
+        .filter(|cmd| matches!(cmd, DataCommand::Subscribe(SubscribeCommand::Quotes(_))))
+        .count();
+    let greeks_subs = recorded
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                DataCommand::Subscribe(SubscribeCommand::OptionGreeks(_))
+            )
+        })
+        .count();
+
+    assert_eq!(
+        quote_subs, 6,
+        "Last trade should drain deferred quote subscriptions"
+    );
+    assert_eq!(greeks_subs, 0, "Greeks subscriptions should remain skipped");
+}
+
+fn make_atm_trade(atm_id: InstrumentId, price: &str, ts: u64) -> TradeTick {
+    TradeTick::new(
+        atm_id,
+        Price::from(price),
+        Quantity::from("1"),
+        AggressorSide::Buy,
+        TradeId::new("1"),
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    )
+}
+
+fn make_atm_subscribe_option_chain(
+    series_id: OptionSeriesId,
+    strike_range: StrikeRange,
+    atm_instrument_id: Option<InstrumentId>,
+    include_greeks: bool,
+    client_id: Option<ClientId>,
+    venue: Option<Venue>,
+) -> SubscribeOptionChain {
+    SubscribeOptionChain::new(
+        series_id,
+        strike_range,
+        Some(1000),
+        UUID4::new(),
+        UnixNanos::default(),
+        client_id,
+        venue,
+        None,
+    )
+    .with_atm_instrument_id(atm_instrument_id)
+    .with_include_greeks(include_greeks)
+}
+
+fn subscribed_quote_instrument_ids(recorded: &[DataCommand]) -> Vec<InstrumentId> {
+    let mut ids: Vec<InstrumentId> = recorded
+        .iter()
+        .filter_map(|cmd| match cmd {
+            DataCommand::Subscribe(SubscribeCommand::Quotes(sub)) => Some(sub.instrument_id),
+            _ => None,
+        })
+        .collect();
+    ids.sort_by_key(ToString::to_string);
+    ids
+}
+
+/// A last trade that shifts ATM must bring the newly in-range strikes online, which only
+/// happens if the engine drains deferred commands after trades as well as after quotes.
+#[rstest]
+fn test_option_chain_last_trade_shift_subscribes_newly_active_strikes(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    for strike in &["45000.000", "50000.000", "55000.000", "60000.000"] {
+        let call = make_btc_option(strike, OptionKind::Call);
+        let put = make_btc_option(strike, OptionKind::Put);
+        let _ = cache.borrow_mut().add_instrument(call);
+        let _ = cache.borrow_mut().add_instrument(put);
+    }
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let cmd = make_atm_subscribe_option_chain(
+        make_series_id(),
+        StrikeRange::AtmRelative {
+            strikes_above: 1,
+            strikes_below: 1,
+        },
+        Some(atm_id),
+        false,
+        Some(client_id),
+        Some(venue),
+    );
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    // First trade bootstraps the window around 50000: 45000, 50000, 55000.
+    data_engine
+        .borrow_mut()
+        .process_data(Data::Trade(make_atm_trade(atm_id, "50000.000", 1)));
+    recorder.borrow_mut().clear();
+
+    // Second trade moves ATM to 55000, so the window becomes 50000, 55000, 60000.
+    data_engine
+        .borrow_mut()
+        .process_data(Data::Trade(make_atm_trade(atm_id, "55000.000", 2)));
+
+    let recorded = recorder.borrow();
+    assert_eq!(
+        subscribed_quote_instrument_ids(&recorded),
+        vec![
+            InstrumentId::from("BTC-20240101-60000.000-C.DERIBIT"),
+            InstrumentId::from("BTC-20240101-60000.000-P.DERIBIT"),
+        ],
+        "Strikes entering the window should be subscribed after the shifting trade"
+    );
+
+    let unsub_quotes = recorded
+        .iter()
+        .filter(|cmd| matches!(cmd, DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(_))))
+        .count();
+    assert_eq!(
+        unsub_quotes, 2,
+        "Strikes leaving the window should be unsubscribed"
+    );
+}
+
+/// A cached last trade lets the chain bootstrap at subscribe time instead of waiting for
+/// the first live trade.
+#[rstest]
+fn test_subscribe_option_chain_seeds_atm_from_cached_trade(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    for strike in &["45000.000", "50000.000", "55000.000"] {
+        let call = make_btc_option(strike, OptionKind::Call);
+        let put = make_btc_option(strike, OptionKind::Put);
+        let _ = cache.borrow_mut().add_instrument(call);
+        let _ = cache.borrow_mut().add_instrument(put);
+    }
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    cache
+        .borrow_mut()
+        .add_trade(make_atm_trade(atm_id, "50000.000", 1))
+        .unwrap();
+
+    let cmd = make_atm_subscribe_option_chain(
+        make_series_id(),
+        StrikeRange::AtmRelative {
+            strikes_above: 1,
+            strikes_below: 1,
+        },
+        Some(atm_id),
+        false,
+        Some(client_id),
+        Some(venue),
+    );
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    let recorded = recorder.borrow();
+    assert_eq!(
+        subscribed_quote_instrument_ids(&recorded).len(),
+        6,
+        "Cached last trade should bootstrap the window without waiting for a live trade"
+    );
+}
+
+#[rstest]
+fn test_unsubscribe_option_chain_unsubscribes_atm_trades(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    let cmd = make_atm_subscribe_option_chain(
+        series_id,
+        StrikeRange::Fixed(vec![Price::from("50000.000")]),
+        Some(atm_id),
+        true,
+        Some(client_id),
+        Some(venue),
+    );
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    let trade_subs: Vec<InstrumentId> = recorder
+        .borrow()
+        .iter()
+        .filter_map(|cmd| match cmd {
+            DataCommand::Subscribe(SubscribeCommand::Trades(sub)) => Some(sub.instrument_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trade_subs, vec![atm_id], "Expected ATM trade subscription");
+
+    recorder.borrow_mut().clear();
+
+    let unsub_cmd = make_unsubscribe_option_chain(series_id, Some(client_id), Some(venue));
+    data_engine.borrow_mut().execute(unsub_cmd);
+
+    let unsub_trades: Vec<InstrumentId> = recorder
+        .borrow()
+        .iter()
+        .filter_map(|cmd| match cmd {
+            DataCommand::Unsubscribe(UnsubscribeCommand::Trades(unsub)) => {
+                Some(unsub.instrument_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unsub_trades,
+        vec![atm_id],
+        "Teardown should release the ATM trade stream"
+    );
+}
+
+#[rstest]
+#[case::delta_needs_greeks(
+    StrikeRange::Delta {
+        target: 0.25,
+        tolerance: 0.05,
+    },
+    None,
+)]
+#[case::atm_range_without_atm_source(
+    StrikeRange::AtmRelative {
+        strikes_above: 1,
+        strikes_below: 1,
+    },
+    None,
+)]
+fn test_subscribe_option_chain_rejects_unresolvable_range_without_greeks(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    #[case] strike_range: StrikeRange,
+    #[case] atm_instrument_id: Option<InstrumentId>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let cmd = make_atm_subscribe_option_chain(
+        make_series_id(),
+        strike_range,
+        atm_instrument_id,
+        false,
+        Some(client_id),
+        Some(venue),
+    );
+    let result = data_engine
+        .borrow_mut()
+        .execute_subscribe(SubscribeCommand::OptionChain(cmd));
+
+    assert!(result.is_err(), "Unresolvable range should be rejected");
+    assert!(
+        recorder.borrow().is_empty(),
+        "Rejected subscription should not forward any commands"
+    );
+}
+
+/// `Delta` resolves from Greeks, so it stays valid while Greeks are subscribed even when
+/// ATM comes from a last trade.
+#[rstest]
+fn test_subscribe_option_chain_allows_delta_range_with_greeks(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let cmd = make_atm_subscribe_option_chain(
+        make_series_id(),
+        StrikeRange::Delta {
+            target: 0.25,
+            tolerance: 0.05,
+        },
+        Some(InstrumentId::from("BTC-PERPETUAL.DERIBIT")),
+        true,
+        Some(client_id),
+        Some(venue),
+    );
+    let result = data_engine
+        .borrow_mut()
+        .execute_subscribe(SubscribeCommand::OptionChain(cmd));
+
+    assert!(result.is_ok(), "Delta range with Greeks should be accepted");
+}
+
+fn atm_trade_subscribes(recorded: &[DataCommand]) -> Vec<InstrumentId> {
+    recorded
+        .iter()
+        .filter_map(|cmd| match cmd {
+            DataCommand::Subscribe(SubscribeCommand::Trades(sub)) => Some(sub.instrument_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn atm_trade_unsubscribes(recorded: &[DataCommand]) -> Vec<InstrumentId> {
+    recorded
+        .iter()
+        .filter_map(|cmd| match cmd {
+            DataCommand::Unsubscribe(UnsubscribeCommand::Trades(unsub)) => {
+                Some(unsub.instrument_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ATM instrument can trade on another venue, and `get_client` gives `client_id`
+/// precedence over `venue`. Passing the chain's client would route ATM trades to a client
+/// that does not serve the instrument, so routing must ignore it on every path.
+#[rstest]
+fn test_option_chain_atm_trades_route_by_atm_venue_not_chain_client(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let options_client_id = ClientId::new("DERIBIT");
+    let options_venue = Venue::new("DERIBIT");
+    let options_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock.clone(),
+        cache.clone(),
+        options_client_id,
+        options_venue,
+        Some(options_venue),
+        &options_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let atm_client_id = ClientId::new("ARCA");
+    let atm_venue = Venue::new("ARCA");
+    let atm_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        atm_client_id,
+        atm_venue,
+        Some(atm_venue),
+        &atm_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let atm_id = InstrumentId::from("SPY.ARCA");
+    let series_id = make_series_id();
+    let cmd = make_atm_subscribe_option_chain(
+        series_id,
+        StrikeRange::Fixed(vec![Price::from("50000.000")]),
+        Some(atm_id),
+        true,
+        // The chain explicitly names the options client, as live strategies commonly do
+        Some(options_client_id),
+        Some(options_venue),
+    );
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    assert_eq!(
+        atm_trade_subscribes(&atm_recorder.borrow()),
+        vec![atm_id],
+        "ATM trades belong to the client routed for the ATM venue"
+    );
+    assert!(
+        atm_trade_subscribes(&options_recorder.borrow()).is_empty(),
+        "ATM trades must not be sent to the option chain's client"
+    );
+
+    atm_recorder.borrow_mut().clear();
+    options_recorder.borrow_mut().clear();
+
+    let unsub_cmd =
+        make_unsubscribe_option_chain(series_id, Some(options_client_id), Some(options_venue));
+    data_engine.borrow_mut().execute(unsub_cmd);
+
+    assert_eq!(
+        atm_trade_unsubscribes(&atm_recorder.borrow()),
+        vec![atm_id],
+        "Unsubscribe must resolve to the same client as subscribe"
+    );
+    assert!(
+        atm_trade_unsubscribes(&options_recorder.borrow()).is_empty(),
+        "ATM unsubscribe must not be sent to the option chain's client"
+    );
+}
+
+/// `get_client(None, venue)` falls through to the default client when the ATM venue
+/// has no routing entry. Last-trade ATM must not use that fallback.
+#[rstest]
+fn test_option_chain_atm_does_not_fall_back_to_default_client(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let options_client_id = ClientId::new("OPRA");
+    let options_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    let client = MockDataClient::new_with_recorder(
+        clock,
+        cache.clone(),
+        options_client_id,
+        None,
+        Some(options_recorder.clone()),
+    );
+    let adapter = DataClientAdapter::new(options_client_id, None, true, true, Box::new(client));
+    data_engine.borrow_mut().register_client(adapter, None);
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let cmd = make_atm_subscribe_option_chain(
+        make_series_id(),
+        StrikeRange::Fixed(vec![Price::from("50000.000")]),
+        Some(InstrumentId::from("SPY.ARCA")),
+        true,
+        Some(options_client_id),
+        Some(Venue::new("DERIBIT")),
+    );
+    let result = data_engine
+        .borrow_mut()
+        .execute_subscribe(SubscribeCommand::OptionChain(cmd));
+
+    assert!(
+        result.is_err(),
+        "Missing ATM venue client should reject the subscription"
+    );
+    assert!(
+        !data_engine
+            .borrow()
+            .has_option_chain_manager(&make_series_id()),
+        "Rejected subscribe must not create a manager"
+    );
+    assert!(
+        atm_trade_subscribes(&options_recorder.borrow()).is_empty(),
+        "ATM trades must not fall through to the default options client"
+    );
+}
+
+#[rstest]
+fn test_resubscribe_option_chain_releases_previous_atm_trades(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let series_id = make_series_id();
+    let strike_range = StrikeRange::Fixed(vec![Price::from("50000.000")]);
+    let first_atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                strike_range.clone(),
+                Some(first_atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+
+    let second_atm_id = InstrumentId::from("ETH-PERPETUAL.DERIBIT");
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                strike_range,
+                Some(second_atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    let recorded = recorder.borrow();
+    assert_eq!(
+        atm_trade_unsubscribes(&recorded),
+        vec![first_atm_id],
+        "Re-subscribing should release the previous ATM instrument"
+    );
+    assert_eq!(
+        atm_trade_subscribes(&recorded),
+        vec![second_atm_id],
+        "Re-subscribing should pick up the new ATM instrument"
+    );
+}
+
+/// An ATM trade at or past expiration tears the series down, which must release the ATM
+/// trade stream along with the option subscriptions.
+#[rstest]
+fn test_option_chain_expiry_releases_atm_trades(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+
+    let expired_trade = make_atm_trade(atm_id, "50000.000", series_id.expiration_ns.as_u64());
+    data_engine
+        .borrow_mut()
+        .process_data(Data::Trade(expired_trade));
+
+    assert!(
+        !data_engine.borrow().has_option_chain_manager(&series_id),
+        "Expired series should be torn down"
+    );
+    assert_eq!(
+        atm_trade_unsubscribes(&recorder.borrow()),
+        vec![atm_id],
+        "Series teardown should release the ATM trade stream"
+    );
+}
+
+/// Adapter trade subs are a set, so unsubscribing one series must not drop SPY last
+/// trades still needed by another series.
+#[rstest]
+fn test_unsubscribe_one_chain_keeps_shared_atm_trades(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let options_client_id = ClientId::new("DERIBIT");
+    let options_venue = Venue::new("DERIBIT");
+    let options_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock.clone(),
+        cache.clone(),
+        options_client_id,
+        options_venue,
+        Some(options_venue),
+        &options_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let atm_venue = Venue::new("ARCA");
+    let atm_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        ClientId::new("ARCA"),
+        atm_venue,
+        Some(atm_venue),
+        &atm_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let exp_a = UnixNanos::from(1_704_067_200_000_000_000u64);
+    let exp_b = UnixNanos::from(1_704_153_600_000_000_000u64);
+    let call_a = make_crypto_option(
+        "BTC-20240101-50000.000-C.DERIBIT",
+        "BTC",
+        "BTC",
+        "50000.000",
+        OptionKind::Call,
+        exp_a,
+    );
+    let call_b = make_crypto_option(
+        "BTC-20240102-50000.000-C.DERIBIT",
+        "BTC",
+        "BTC",
+        "50000.000",
+        OptionKind::Call,
+        exp_b,
+    );
+    let _ = cache.borrow_mut().add_instrument(call_a);
+    let _ = cache.borrow_mut().add_instrument(call_b);
+
+    let atm_id = InstrumentId::from("SPY.ARCA");
+    let series_a = OptionSeriesId::new(
+        options_venue,
+        ustr::Ustr::from("BTC"),
+        ustr::Ustr::from("BTC"),
+        exp_a,
+    );
+    let series_b = OptionSeriesId::new(
+        options_venue,
+        ustr::Ustr::from("BTC"),
+        ustr::Ustr::from("BTC"),
+        exp_b,
+    );
+    let strike_range = StrikeRange::Fixed(vec![Price::from("50000.000")]);
+
+    for series_id in [series_a, series_b] {
+        data_engine
+            .borrow_mut()
+            .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+                make_atm_subscribe_option_chain(
+                    series_id,
+                    strike_range.clone(),
+                    Some(atm_id),
+                    true,
+                    Some(options_client_id),
+                    Some(options_venue),
+                ),
+            )));
+    }
+
+    atm_recorder.borrow_mut().clear();
+    data_engine
+        .borrow_mut()
+        .execute(make_unsubscribe_option_chain(
+            series_a,
+            Some(options_client_id),
+            Some(options_venue),
+        ));
+
+    assert!(
+        atm_trade_unsubscribes(&atm_recorder.borrow()).is_empty(),
+        "Shared ATM last-trade stream must survive unsubscribing one series"
+    );
+    assert!(
+        data_engine.borrow().has_option_chain_manager(&series_b),
+        "The other series must remain subscribed"
+    );
+
+    data_engine
+        .borrow_mut()
+        .execute(make_unsubscribe_option_chain(
+            series_b,
+            Some(options_client_id),
+            Some(options_venue),
+        ));
+    assert_eq!(
+        atm_trade_unsubscribes(&atm_recorder.borrow()),
+        vec![atm_id],
+        "Last remaining series should release the ATM trade stream"
+    );
+}
+
+/// An explicit `subscribe_trades` on the ATM instrument must keep the wire after
+/// the option chain that implicitly subscribed it is torn down.
+#[rstest]
+fn test_unsubscribe_option_chain_keeps_explicit_atm_trade_sub(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let options_client_id = ClientId::new("DERIBIT");
+    let options_venue = Venue::new("DERIBIT");
+    let options_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock.clone(),
+        cache.clone(),
+        options_client_id,
+        options_venue,
+        Some(options_venue),
+        &options_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let atm_venue = Venue::new("ARCA");
+    let atm_recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        ClientId::new("ARCA"),
+        atm_venue,
+        Some(atm_venue),
+        &atm_recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let atm_id = InstrumentId::from("SPY.ARCA");
+    let (handler, _saver) = get_typed_message_saving_handler::<TradeTick>(None);
+    msgbus::subscribe_trades(switchboard::get_trades_topic(atm_id).into(), handler, None);
+
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(options_client_id),
+                Some(options_venue),
+            ),
+        )));
+
+    atm_recorder.borrow_mut().clear();
+    data_engine
+        .borrow_mut()
+        .execute(make_unsubscribe_option_chain(
+            series_id,
+            Some(options_client_id),
+            Some(options_venue),
+        ));
+
+    assert!(
+        atm_trade_unsubscribes(&atm_recorder.borrow()).is_empty(),
+        "Explicit trade subscribers must keep the ATM wire"
+    );
+}
+
+#[rstest]
+fn test_reset_unsubscribes_atm_trades(clock: Rc<RefCell<TestClock>>, cache: Rc<RefCell<Cache>>) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+    data_engine.borrow_mut().reset();
+
+    assert!(
+        !data_engine.borrow().has_option_chain_manager(&series_id),
+        "Reset should drop option chain managers"
+    );
+    assert_eq!(
+        atm_trade_unsubscribes(&recorder.borrow()),
+        vec![atm_id],
+        "Reset should release the ATM trade stream before client.reset()"
+    );
+}
+
+#[rstest]
+fn test_stop_unsubscribes_atm_trades(clock: Rc<RefCell<TestClock>>, cache: Rc<RefCell<Cache>>) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+    data_engine.borrow_mut().stop();
+
+    assert!(
+        !data_engine.borrow().has_option_chain_manager(&series_id),
+        "Stop should drop option chain managers"
+    );
+    assert_eq!(
+        atm_trade_unsubscribes(&recorder.borrow()),
+        vec![atm_id],
+        "Stop should release the ATM trade stream before client.stop()"
+    );
+}
+
+#[rstest]
+fn test_dispose_unsubscribes_atm_trades(clock: Rc<RefCell<TestClock>>, cache: Rc<RefCell<Cache>>) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+    data_engine.borrow_mut().dispose();
+
+    assert!(
+        !data_engine.borrow().has_option_chain_manager(&series_id),
+        "Dispose should drop option chain managers"
+    );
+    assert_eq!(
+        atm_trade_unsubscribes(&recorder.borrow()),
+        vec![atm_id],
+        "Dispose should release the ATM trade stream before client.dispose()"
+    );
+}
+
+/// A strike-range edit that keeps the same ATM instrument must not drop the last-trade
+/// wire. Adapter trade subs are a set, so unsub-then-sub would leave a gap.
+#[rstest]
+fn test_resubscribe_same_atm_keeps_trade_stream(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("55000.000", OptionKind::Call);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000"), Price::from("55000.000")]),
+                Some(atm_id),
+                true,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    assert!(
+        atm_trade_unsubscribes(&recorder.borrow()).is_empty(),
+        "Same-ATM resubscribe must not unsubscribe the last-trade stream"
+    );
+}
+
+#[rstest]
+fn test_unsubscribe_option_chain_skips_greeks_when_not_subscribed(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let series_id = make_series_id();
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(
+            make_atm_subscribe_option_chain(
+                series_id,
+                StrikeRange::Fixed(vec![Price::from("50000.000")]),
+                Some(InstrumentId::from("BTC-PERPETUAL.DERIBIT")),
+                false,
+                Some(client_id),
+                Some(venue),
+            ),
+        )));
+
+    recorder.borrow_mut().clear();
+    data_engine
+        .borrow_mut()
+        .execute(make_unsubscribe_option_chain(
+            series_id,
+            Some(client_id),
+            Some(venue),
+        ));
+
+    let greeks_unsubs = recorder
+        .borrow()
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                DataCommand::Unsubscribe(UnsubscribeCommand::OptionGreeks(_))
+            )
+        })
+        .count();
+    assert_eq!(
+        greeks_unsubs, 0,
+        "Greeks-free chains must not send option-Greeks unsubscribes"
+    );
+}
+
+/// With Greeks skipped, strike rows must stay Greeks-free even while Greeks flow on the
+/// bus, including through the engine's pre-bootstrap Greeks feed.
+#[rstest]
+fn test_option_chain_include_greeks_false_yields_greeks_free_rows(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let _ = msgbus::get_message_bus();
+    let data_engine = make_option_chain_engine(clock.clone(), cache.clone());
+
+    let client_id = ClientId::new("DERIBIT");
+    let venue = Venue::new("DERIBIT");
+    let recorder = Rc::new(RefCell::new(Vec::<DataCommand>::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        Some(venue),
+        &recorder,
+        &mut data_engine.borrow_mut(),
+    );
+
+    let strike = Price::from("50000.000");
+    let call = make_btc_option("50000.000", OptionKind::Call);
+    let call_id = call.id();
+    let put = make_btc_option("50000.000", OptionKind::Put);
+    let _ = cache.borrow_mut().add_instrument(call);
+    let _ = cache.borrow_mut().add_instrument(put);
+
+    let atm_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let series_id = make_series_id();
+    let (handler, saver) = get_typed_message_saving_handler::<OptionChainSlice>(None);
+    msgbus::subscribe_option_chain(
+        switchboard::get_option_chain_topic(series_id).into(),
+        handler,
+        None,
+    );
+
+    // Raw mode so each option quote publishes a slice immediately
+    let cmd = SubscribeOptionChain::new(
+        series_id,
+        StrikeRange::AtmRelative {
+            strikes_above: 1,
+            strikes_below: 1,
+        },
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(client_id),
+        Some(venue),
+        None,
+    )
+    .with_atm_instrument_id(Some(atm_id))
+    .with_include_greeks(false);
+    data_engine
+        .borrow_mut()
+        .execute(DataCommand::Subscribe(SubscribeCommand::OptionChain(cmd)));
+
+    let greeks = OptionGreeks {
+        instrument_id: call_id,
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: 0.55,
+            ..Default::default()
+        },
+        underlying_price: Some(50_000.0),
+        ts_event: UnixNanos::from(1u64),
+        ts_init: UnixNanos::from(1u64),
+        ..Default::default()
+    };
+
+    // Before bootstrap the engine feeds Greeks straight to the manager, and after
+    // bootstrap no Greeks handler is registered; neither may attach Greeks to a row.
+    data_engine
+        .borrow_mut()
+        .process_data(Data::OptionGreeks(greeks));
+    data_engine
+        .borrow_mut()
+        .process_data(Data::Trade(make_atm_trade(atm_id, "50000.000", 2)));
+    data_engine
+        .borrow_mut()
+        .process_data(Data::OptionGreeks(greeks));
+
+    let quote = QuoteTick::new(
+        call_id,
+        Price::from("100.00"),
+        Price::from("101.00"),
+        Quantity::from("1"),
+        Quantity::from("1"),
+        UnixNanos::from(3u64),
+        UnixNanos::from(3u64),
+    );
+    data_engine.borrow_mut().process_data(Data::Quote(quote));
+
+    let slices = saver.get_messages();
+    let last = slices.last().expect("expected a published slice");
+    let row = last.get_call(&strike).expect("expected a call row");
+    assert_eq!(row.quote, quote);
+    assert!(
+        row.greeks.is_none(),
+        "Rows must carry no Greeks when Greeks are skipped"
+    );
+    assert_eq!(last.atm_instrument_id, Some(atm_id));
+    assert_eq!(last.atm_price, Some(Price::from("50000.000")));
 }
 
 #[rstest]

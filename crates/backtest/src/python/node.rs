@@ -23,7 +23,10 @@ use nautilus_common::{actor::data_actor::ImportableActorConfig, python::cache::P
 #[cfg(feature = "examples")]
 use nautilus_core::python::to_pytype_err;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::{AccountId, ActorId, StrategyId, Venue};
+use nautilus_model::{
+    identifiers::{AccountId, ActorId, StrategyId, Venue},
+    python::instruments::pyobject_to_instrument_any,
+};
 use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
 use nautilus_trading::examples::strategies::{
@@ -198,6 +201,31 @@ impl BacktestNode {
         account_id: Option<AccountId>,
     ) -> PyResult<Bound<'py, PyAny>> {
         generate_account_report(self.require_engine(run_config_id)?, py, venue, account_id)
+    }
+
+    /// Adds an instrument definition to the engine for the given run config.
+    ///
+    /// Same path as catalog-driven `build`: `BacktestEngine.add_instrument`
+    /// (simulated exchange, expiration timer, data cache). No quote stream is
+    /// loaded. Call after `build` and before `run`. Re-adding an id that
+    /// `build` already loaded replaces that matching engine; skip those ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists for the run config ID or adding the
+    /// instrument fails.
+    #[pyo3(name = "add_instrument")]
+    fn py_add_instrument(
+        &mut self,
+        py: Python,
+        run_config_id: &str,
+        instrument: Py<PyAny>,
+    ) -> PyResult<()> {
+        let instrument_any = pyobject_to_instrument_any(py, instrument)?;
+        let engine = self.require_engine_mut(run_config_id)?;
+        engine
+            .add_instrument(&instrument_any)
+            .map_err(to_pyruntime_err)
     }
 
     /// Adds a constructed Python actor to the engine for the given run config.

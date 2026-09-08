@@ -15,15 +15,16 @@
 
 //! Reactive ATM (at-the-money) price tracker for option chain subscriptions.
 //!
-//! ATM price is always derived from the exchange-provided forward price
-//! embedded in each option greeks/ticker update.
+//! ATM price is derived from the exchange-provided forward price embedded in
+//! option greeks, or from a configured instrument's last trade. The caller owns
+//! that choice: the manager only feeds one of the two update methods.
 
 use nautilus_core::correctness::CorrectnessResult;
 use nautilus_model::{data::option_chain::OptionGreeks, types::Price};
 
-/// Tracks the raw ATM price reactively from the forward price in option greeks.
+/// Tracks the ATM price from option Greeks `underlying_price` or a last trade.
 ///
-/// Does not interact with cache - receives updates via handler callbacks.
+/// Does not interact with cache. Updates arrive via handler callbacks.
 /// Closest-strike resolution is delegated to `StrikeRange::resolve()`.
 #[derive(Debug)]
 pub struct AtmTracker {
@@ -52,7 +53,7 @@ impl AtmTracker {
         self.atm_price
     }
 
-    /// Sets the initial ATM price (e.g. from a forward price fetched via HTTP).
+    /// Sets the initial ATM price (e.g. from an HTTP reference price).
     ///
     /// This allows instant bootstrap without waiting for the first WebSocket tick.
     /// Subsequent live updates will overwrite this value normally.
@@ -60,10 +61,24 @@ impl AtmTracker {
         self.atm_price = Some(price);
     }
 
+    /// Updates ATM from a last-trade (or other explicit) price.
+    ///
+    /// Returns `true` if the stored ATM price changed.
+    pub fn update_from_price(&mut self, price: Price) -> bool {
+        if self.atm_price == Some(price) {
+            return false;
+        }
+        self.atm_price = Some(price);
+        true
+    }
+
     /// Updates from an option greeks event.
     ///
     /// Extracts `underlying_price` from the greeks - the exchange-provided
     /// forward price for this expiry. Returns `true` if the ATM price was updated.
+    ///
+    /// The caller must not route greeks here when a last-trade ATM instrument is
+    /// configured; `OptionChainManager` gates on `atm_instrument_id`.
     pub fn update_from_option_greeks(&mut self, greeks: &OptionGreeks) -> bool {
         self.try_update_from_option_greeks(greeks).unwrap_or(false)
     }
@@ -165,5 +180,13 @@ mod tests {
         };
         assert!(tracker.update_from_option_greeks(&greeks));
         assert_eq!(tracker.atm_price().unwrap(), Price::from("50500.1234"));
+    }
+
+    #[rstest]
+    fn test_atm_tracker_update_from_price() {
+        let mut tracker = AtmTracker::new();
+        assert!(tracker.update_from_price(Price::from("501.25")));
+        assert_eq!(tracker.atm_price().unwrap(), Price::from("501.25"));
+        assert!(!tracker.update_from_price(Price::from("501.25")));
     }
 }

@@ -24,13 +24,22 @@ use pyo3::{prelude::*, pyclass::CompareOp};
 
 use crate::{
     identifiers::{OptionSeriesId, Venue},
+    instruments::OptionContract,
     python::option_series_id_error_to_pyvalue_err,
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OptionSeriesId {
-    /// Identifies a unique option series: a specific venue + underlying + settlement currency + expiration.
+    /// Identifies a unique option series: venue + underlying + settlement currency + expiration.
+    ///
+    /// This is the option expiry key the chain manager matches against
+    /// `crate.instruments.OptionContract.expiration_ns`. It is not the ATM
+    /// instrument. Last-trade ATM is a separate `InstrumentId` (for example
+    /// `SPY.ARCA`); the series is `VENUE:UNDERLYING:SETTLEMENT:<expiration_ns>`.
+    /// Copy `expiration_ns` from catalog contracts via `Self.from_option_contract`.
+    /// `Self.from_expiry` with `"YYYY-MM-DD"` is midnight UTC and will not match
+    /// a 20:00 NY stamp.
     #[new]
     fn py_new(
         venue: &str,
@@ -51,6 +60,9 @@ impl OptionSeriesId {
     ///
     /// The `date_str` is parsed via `UnixNanos::FromStr`, which accepts `"YYYY-MM-DD"`,
     /// RFC 3339 timestamps, integer nanoseconds, or floating-point seconds.
+    /// `"YYYY-MM-DD"` is midnight UTC, which usually does not match
+    /// `OptionContract.expiration_ns` (often 20:00 `America/New_York`).
+    /// Prefer `Self.from_option_contract` so the series key matches the catalog.
     ///
     /// # Errors
     ///
@@ -65,6 +77,16 @@ impl OptionSeriesId {
     ) -> PyResult<Self> {
         Self::from_expiry(venue, underlying, settlement_currency, date_str)
             .map_err(option_series_id_error_to_pyvalue_err)
+    }
+
+    /// Creates an `OptionSeriesId` from an `OptionContract`.
+    ///
+    /// Copies venue, underlying, settlement currency, and `expiration_ns` from the
+    /// contract so the series key matches the catalog the chain manager resolves.
+    #[staticmethod]
+    #[pyo3(name = "from_option_contract")]
+    fn py_from_option_contract(option: &OptionContract) -> Self {
+        Self::from_option_contract(option)
     }
 
     #[staticmethod]

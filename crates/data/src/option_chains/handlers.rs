@@ -20,7 +20,7 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_common::{msgbus::Handler, timer::TimeEvent};
 use nautilus_core::WeakCell;
 use nautilus_model::{
-    data::{QuoteTick, option_chain::OptionGreeks},
+    data::{QuoteTick, TradeTick, option_chain::OptionGreeks},
     identifiers::OptionSeriesId,
 };
 use ustr::Ustr;
@@ -83,6 +83,35 @@ impl Handler<OptionGreeks> for OptionChainGreeksHandler {
     fn handle(&self, greeks: &OptionGreeks) {
         if let Some(mgr) = self.manager.upgrade() {
             mgr.borrow_mut().handle_greeks(greeks);
+        }
+    }
+}
+
+/// Routes incoming trade ticks for the ATM instrument to the `OptionChainManager`.
+#[derive(Debug)]
+pub struct OptionChainTradeHandler {
+    manager: WeakCell<OptionChainManager>,
+    id: Ustr,
+}
+
+impl OptionChainTradeHandler {
+    pub fn new(manager: &Rc<RefCell<OptionChainManager>>, series_id: OptionSeriesId) -> Self {
+        let id = Ustr::from(&format!("OptionChainTradeHandler({series_id})"));
+        Self {
+            manager: WeakCell::from(Rc::downgrade(manager)),
+            id,
+        }
+    }
+}
+
+impl Handler<TradeTick> for OptionChainTradeHandler {
+    fn id(&self) -> Ustr {
+        self.id
+    }
+
+    fn handle(&self, trade: &TradeTick) {
+        if let Some(mgr) = self.manager.upgrade() {
+            mgr.borrow_mut().handle_trade(trade);
         }
     }
 }
